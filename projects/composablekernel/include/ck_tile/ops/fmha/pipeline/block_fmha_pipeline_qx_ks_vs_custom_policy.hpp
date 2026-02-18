@@ -365,7 +365,18 @@ struct BlockFmhaPipelineQXKSVSCustomPolicy : BlockFmhaPipelineQXCustomPolicy<QLo
             constexpr index_t MaxVectorSize = 16 / sizeof(KDataType);
             constexpr index_t ElemPerThread = (kNPerBlock * kKPerBlock) / kBlockSize;
 
-            return min(MaxVectorSize, ElemPerThread);
+            constexpr index_t alignment = min(MaxVectorSize, ElemPerThread);
+
+            // Match Triton's in-thread transpose heuristic: limit to 64-bit (4x16-bit) vector
+            // granularity for better LDS store/load scheduling.
+            if constexpr(CK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE && sizeof(KDataType) == 2)
+            {
+                return min(alignment, index_t{4});
+            }
+            else
+            {
+                return alignment;
+            }
         }
     }
 
@@ -404,11 +415,25 @@ struct BlockFmhaPipelineQXKSVSCustomPolicy : BlockFmhaPipelineQXCustomPolicy<QLo
                                              ? kMaxVecLoad
                                              : (total_pixels / kMinVecLoad);
 
-            return kVecLoad;
+            if constexpr(CK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE && !AsyncCopy && sizeof(VDataType) == 2)
+            {
+                return min(kVecLoad, index_t{4});
+            }
+            else
+            {
+                return kVecLoad;
+            }
         }
         else
         {
-            return kMaxVecLoad;
+            if constexpr(CK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE && !AsyncCopy && sizeof(VDataType) == 2)
+            {
+                return min(kMaxVecLoad, index_t{4});
+            }
+            else
+            {
+                return kMaxVecLoad;
+            }
         }
     }
 
