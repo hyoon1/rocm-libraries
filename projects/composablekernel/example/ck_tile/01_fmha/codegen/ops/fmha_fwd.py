@@ -1148,7 +1148,8 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
                 (128, 128) : [
                     FmhaFwdTileSize( 64,  64,  32, 128,  32,  128,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1,
                                     CppConstraint("(a.max_seqlen_q < 4096) || (get_num_blocks(128) < num_cus * min_cu_util_rate)")),
-                    FmhaFwdTileSize(128, 128,  32, 128,  32,  128,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,  -1,
+                    # RDNA (gfx11) default: align with Triton fwd_prefill.py (BLOCK_M=128, BLOCK_N=64, num_warps=8, waves_per_eu=6).
+                    FmhaFwdTileSize(128,  64,  32, 128,  32,  128,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   6,
                                     CppConstraint("(a.max_seqlen_q >= 4096) && (get_num_blocks(128) >= num_cus * min_cu_util_rate)")),  # fmt: skip
                 ],  # fmt: skip
                 (192, 128) : [FmhaFwdTileSize( 64,  64,  32, 128,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
