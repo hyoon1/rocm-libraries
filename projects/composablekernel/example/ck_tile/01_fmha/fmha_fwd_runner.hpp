@@ -10,6 +10,7 @@
 #include "ck_tile/utility/json_dump.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <cmath>
@@ -147,6 +148,176 @@ int override_num_splits_if_necessary(
     }
 
     return num_splits;
+}
+
+inline bool ck_tile_is_rdna_arch(const std::string& arch)
+{
+    // Apply LLC-aware head grouping only on gfx11/gfx12 as requested.
+    return arch.rfind("gfx11", 0) == 0 || arch.rfind("gfx12", 0) == 0;
+}
+
+inline std::string ck_tile_trim_gfx_arch(const char* arch_name)
+{
+    if(arch_name == nullptr)
+        return {};
+    std::string arch = arch_name;
+    const auto pos   = arch.find(':');
+    if(pos != std::string::npos)
+        arch = arch.substr(0, pos);
+    return arch;
+}
+
+inline size_t ck_tile_get_llc_cache_bytes(const std::string& arch)
+{
+    // Environment override (in MB). Prefer CK_TILE_*, fallback to Triton env.
+    const char* env_llc_mb = std::getenv("CK_TILE_FMHA_LLC_CACHE_MB");
+    if(env_llc_mb == nullptr)
+        env_llc_mb = std::getenv("FLASH_ATTN_LLC_CACHE_MB");
+    if(env_llc_mb == nullptr)
+        env_llc_mb = std::getenv("FLASH_ATTN_L2_CACHE_MB"); // legacy alias in triton
+    if(env_llc_mb != nullptr)
+    {
+        const int mb = std::atoi(env_llc_mb);
+        if(mb > 0)
+            return static_cast<size_t>(mb) * 1024ull * 1024ull;
+    }
+
+    // Known sizes (bytes)
+    if(arch == "gfx1030")
+        return 128ull * 1024ull * 1024ull;
+    if(arch == "gfx1100")
+        return 96ull * 1024ull * 1024ull;
+    if(arch == "gfx1101")
+        return 64ull * 1024ull * 1024ull;
+    if(arch == "gfx1102")
+        return 32ull * 1024ull * 1024ull;
+    if(arch == "gfx1150")
+        return 32ull * 1024ull * 1024ull;
+    if(arch == "gfx1151")
+        return 32ull * 1024ull * 1024ull;
+    if(arch == "gfx1200")
+        return 32ull * 1024ull * 1024ull;
+    if(arch == "gfx1201")
+        return 64ull * 1024ull * 1024ull;
+
+    // Reasonable defaults by family
+    if(arch.rfind("gfx10", 0) == 0)
+        return 128ull * 1024ull * 1024ull;
+    if(arch.rfind("gfx11", 0) == 0)
+        return 96ull * 1024ull * 1024ull;
+    if(arch.rfind("gfx12", 0) == 0)
+        return 64ull * 1024ull * 1024ull;
+
+    return 0; // unknown
+}
+
+inline bool ck_tile_head_group_log_enabled()
+{
+    const char* env = std::getenv("CK_TILE_FMHA_HEAD_GROUP_LOG");
+    return env != nullptr && std::atoi(env) == 1;
+}
+
+inline std::optional<ck_tile::index_t> ck_tile_get_head_group_size(
+    ck_tile::index_t nhead_q,
+    ck_tile::index_t nhead_k,
+    ck_tile::index_t seqlen_k,
+    ck_tile::index_t hdim_q,
+    ck_tile::index_t hdim_v,
+    size_t elem_bytes_k,
+    size_t elem_bytes_v)
+{
+    // Disable via env
+    const char* env_disable = std::getenv("CK_TILE_FMHA_DISABLE_HEAD_GROUPING");
+    if(env_disable != nullptr && std::atoi(env_disable) == 1)
+        return std::nullopt;
+    env_disable = std::getenv("FLASH_ATTN_DISABLE_HEAD_GROUPING");
+    if(env_disable != nullptr && std::atoi(env_disable) == 1)
+        return std::nullopt;
+
+    // Manual override
+    const char* env_group = std::getenv("CK_TILE_FMHA_HEAD_GROUP_SIZE");
+    if(env_group != nullptr)
+    {
+        const int g = std::atoi(env_group);
+        if(g > 0)
+        {
+            if(nhead_k <= 0 || nhead_q <= 0 || (nhead_q % nhead_k) != 0)
+                return std::nullopt;
+            const ck_tile::index_t gqa_ratio = nhead_q / nhead_k;
+            ck_tile::index_t forced_group    = static_cast<ck_tile::index_t>(std::min<int>(g, nhead_q));
+            if(gqa_ratio > 1)
+            {
+                const ck_tile::index_t min_group_aligned =
+                    ((forced_group + gqa_ratio - 1) / gqa_ratio) * gqa_ratio;
+                forced_group = min_group_aligned;
+            }
+            forced_group = std::min(forced_group, nhead_q);
+            if(forced_group >= nhead_q)
+                return std::nullopt;
+            return forced_group;
+        }
+    }
+
+    int device = 0;
+    if(hipGetDevice(&device) != hipSuccess)
+        return std::nullopt;
+    hipDeviceProp_t props{};
+    if(hipGetDeviceProperties(&props, device) != hipSuccess)
+        return std::nullopt;
+
+    const std::string arch = ck_tile_trim_gfx_arch(props.gcnArchName);
+    if(!ck_tile_is_rdna_arch(arch))
+        return std::nullopt;
+
+    const size_t llc_bytes = ck_tile_get_llc_cache_bytes(arch);
+    if(llc_bytes == 0)
+        return std::nullopt;
+
+    if(nhead_k <= 0 || nhead_q <= 0 || (nhead_q % nhead_k) != 0)
+        return std::nullopt;
+    const ck_tile::index_t gqa_ratio = nhead_q / nhead_k;
+
+    const size_t kv_per_head =
+        static_cast<size_t>(seqlen_k) *
+        (static_cast<size_t>(hdim_q) * elem_bytes_k + static_cast<size_t>(hdim_v) * elem_bytes_v);
+    if(kv_per_head == 0)
+        return std::nullopt;
+
+    const size_t total_kv = static_cast<size_t>(nhead_k) * kv_per_head;
+    constexpr float kThresholdRatio = 1.5f;
+    if(total_kv < static_cast<size_t>(llc_bytes * kThresholdRatio))
+        return std::nullopt;
+
+    const size_t target_llc = llc_bytes; // use 100% LLC like Triton
+    size_t group_size       = target_llc / kv_per_head;
+    if(group_size == 0)
+        group_size = 1;
+    if(group_size >= static_cast<size_t>(nhead_q))
+        return std::nullopt;
+
+    const ck_tile::index_t min_group = std::max<ck_tile::index_t>(1, nhead_q / 16);
+    ck_tile::index_t final_group     = static_cast<ck_tile::index_t>(group_size);
+    if(final_group < min_group)
+        final_group = min_group;
+
+    // Align to GQA ratio to keep nhead_q/nhead_k ratio correct in grouped launches.
+    if(gqa_ratio > 1)
+    {
+        const ck_tile::index_t min_group_aligned =
+            ((min_group + gqa_ratio - 1) / gqa_ratio) * gqa_ratio;
+        if(final_group < min_group_aligned)
+            final_group = min_group_aligned;
+
+        final_group = (final_group / gqa_ratio) * gqa_ratio;
+        if(final_group < min_group_aligned)
+            final_group = min_group_aligned;
+    }
+
+    final_group = std::min(final_group, nhead_q);
+    if(final_group >= nhead_q)
+        return std::nullopt;
+
+    return final_group;
 }
 
 template <typename SMPLComputeDataType>
@@ -1365,7 +1536,159 @@ fwd_result fmha_fwd_run(mode_enum mode,
 
         return fmha_fwd(fmha_traits, fmha_args, sc);
     };
-    const float fwd_ave_time = run_fwd(stream_config);
+
+    const auto offset_const_ptr = [](const void* p, ck_tile::index_t elem_offset, size_t elem_bytes) {
+        if(p == nullptr || elem_offset == 0)
+            return p;
+        return static_cast<const void*>(static_cast<const char*>(p) + elem_offset * elem_bytes);
+    };
+    const auto offset_mut_ptr = [](void* p, ck_tile::index_t elem_offset, size_t elem_bytes) {
+        if(p == nullptr || elem_offset == 0)
+            return p;
+        return static_cast<void*>(static_cast<char*>(p) + elem_offset * elem_bytes);
+    };
+
+    const auto run_fwd_head_grouped = [&](const ck_tile::stream_config& sc,
+                                          ck_tile::index_t group_size) {
+        // Only support plain fwd path (no split-kv / paged-kv / append-kv)
+        fmha_fwd_traits base_traits;
+        init_traits(base_traits);
+
+        fmha_fwd_args base_args;
+        init_args(base_args);
+
+        if(nhead_k == 0 || nhead % nhead_k != 0)
+            return -1.0f;
+        const ck_tile::index_t gqa_ratio = nhead / nhead_k;
+
+        float total_time = 0.0f;
+        bool first_group = true;
+        for(ck_tile::index_t start_h = 0; start_h < nhead; start_h += group_size)
+        {
+            const ck_tile::index_t end_h        = std::min(start_h + group_size, nhead);
+            const ck_tile::index_t heads_q      = end_h - start_h;
+            const ck_tile::index_t start_h_k    = start_h / gqa_ratio;
+            const ck_tile::index_t end_h_k      = ck_tile::integer_divide_ceil(end_h, gqa_ratio);
+            const ck_tile::index_t heads_k      = end_h_k - start_h_k;
+            fmha_fwd_traits fmha_traits         = base_traits;
+            fmha_fwd_args fmha_args             = base_args;
+            fmha_args.nhead_q                   = heads_q;
+            fmha_args.nhead_k                   = heads_k;
+            fmha_args.num_head_q_total          = nhead;
+            fmha_args.head_start                = start_h;
+
+            // Offset per-head pointers
+            fmha_args.q_ptr = offset_const_ptr(
+                fmha_args.q_ptr, start_h * fmha_args.nhead_stride_q, sizeof(QDataType));
+            fmha_args.k_ptr = offset_const_ptr(
+                fmha_args.k_ptr, start_h_k * fmha_args.nhead_stride_k, sizeof(KDataType));
+            fmha_args.v_ptr = offset_const_ptr(
+                fmha_args.v_ptr, start_h_k * fmha_args.nhead_stride_v, sizeof(VDataType));
+            fmha_args.o_ptr = offset_mut_ptr(
+                fmha_args.o_ptr, start_h * fmha_args.nhead_stride_o, sizeof(ODataType));
+
+            if(fmha_args.bias_ptr != nullptr)
+            {
+                fmha_args.bias_ptr = offset_const_ptr(
+                    fmha_args.bias_ptr, start_h * fmha_args.nhead_stride_bias, sizeof(BiasDataType));
+            }
+            if(fmha_args.lse_ptr != nullptr)
+            {
+                fmha_args.lse_ptr = offset_mut_ptr(
+                    fmha_args.lse_ptr, start_h * fmha_args.nhead_stride_lse, sizeof(LSEDataType));
+            }
+            if(fmha_args.rand_val_ptr != nullptr)
+            {
+                fmha_args.rand_val_ptr =
+                    offset_mut_ptr(fmha_args.rand_val_ptr,
+                                   start_h * fmha_args.nhead_stride_randval,
+                                   sizeof(RandValOutputDataType));
+            }
+            if(fmha_args.sink_ptr != nullptr)
+            {
+                fmha_args.sink_ptr =
+                    offset_const_ptr(fmha_args.sink_ptr, start_h, sizeof(float));
+            }
+            if(fmha_args.q_descale_ptr != nullptr)
+            {
+                fmha_args.q_descale_ptr = offset_const_ptr(
+                    fmha_args.q_descale_ptr,
+                    start_h * fmha_args.nhead_stride_q_descale,
+                    sizeof(float));
+            }
+            if(fmha_args.k_descale_ptr != nullptr)
+            {
+                fmha_args.k_descale_ptr = offset_const_ptr(
+                    fmha_args.k_descale_ptr,
+                    start_h_k * fmha_args.nhead_stride_k_descale,
+                    sizeof(float));
+            }
+            if(fmha_args.v_descale_ptr != nullptr)
+            {
+                fmha_args.v_descale_ptr = offset_const_ptr(
+                    fmha_args.v_descale_ptr,
+                    start_h_k * fmha_args.nhead_stride_v_descale,
+                    sizeof(float));
+            }
+
+            ck_tile::stream_config sc_group = sc;
+            if(!first_group)
+                sc_group.log_level_ = 0;
+            const float t = fmha_fwd(fmha_traits, fmha_args, sc_group);
+            if(t < 0.0f)
+                return t;
+            total_time += t;
+            first_group = false;
+        }
+        return total_time;
+    };
+
+    float fwd_ave_time = -1.0f;
+    const bool allow_head_grouping =
+        !use_kvcache && (num_splits <= 1) && !need_append_kvcache &&
+        (mode == mode_enum::batch || mode == mode_enum::group);
+
+    if(allow_head_grouping)
+    {
+        const auto group_size_opt = ck_tile_get_head_group_size(
+            nhead,
+            nhead_k,
+            max_seqlen_k,
+            hdim_q,
+            hdim_v,
+            sizeof(KDataType),
+            sizeof(VDataType));
+        if(group_size_opt.has_value() && group_size_opt.value() < nhead)
+        {
+            if(ck_tile_head_group_log_enabled())
+            {
+                int device = 0;
+                hipDeviceProp_t props{};
+                std::string arch = {};
+                size_t llc_bytes = 0;
+                if(hipGetDevice(&device) == hipSuccess &&
+                   hipGetDeviceProperties(&props, device) == hipSuccess)
+                {
+                    arch      = ck_tile_trim_gfx_arch(props.gcnArchName);
+                    llc_bytes = ck_tile_get_llc_cache_bytes(arch);
+                }
+                const ck_tile::index_t gqa_ratio = (nhead_k > 0 ? (nhead / nhead_k) : 1);
+                const ck_tile::index_t group_sz  = group_size_opt.value();
+                const ck_tile::index_t n_groups  = ck_tile::integer_divide_ceil(nhead, group_sz);
+                std::cout << "[LLC Head Grouping] arch=" << (arch.empty() ? "unknown" : arch)
+                          << " llc_mb=" << (llc_bytes / (1024ull * 1024ull))
+                          << " nhead_q=" << nhead << " nhead_k=" << nhead_k
+                          << " gqa_ratio=" << gqa_ratio << " group_size=" << group_sz
+                          << " groups=" << n_groups << std::endl;
+            }
+            fwd_ave_time = run_fwd_head_grouped(stream_config, group_size_opt.value());
+        }
+    }
+
+    if(fwd_ave_time < 0.0f)
+    {
+        fwd_ave_time = run_fwd(stream_config);
+    }
     if(fwd_ave_time < 0.0f)
     {
         std::cout << ", not supported yet" << std::flush << std::endl;

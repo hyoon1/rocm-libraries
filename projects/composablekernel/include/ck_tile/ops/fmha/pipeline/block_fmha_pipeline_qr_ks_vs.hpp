@@ -10,6 +10,14 @@
 #include "ck_tile/ops/gemm/warp/warp_wmma_gemm_gfx11_utils.hpp"
 #include "ck_tile/ops/reduce/block/block_reduce.hpp"
 
+#ifndef CK_TILE_FMHA_FWD_SW_PREFETCH
+#define CK_TILE_FMHA_FWD_SW_PREFETCH 0
+#endif
+
+#ifndef CK_TILE_FMHA_FWD_SW_PREFETCH_V
+#define CK_TILE_FMHA_FWD_SW_PREFETCH_V 0
+#endif
+
 namespace ck_tile {
 
 namespace fmha_detail {
@@ -426,13 +434,28 @@ struct BlockFmhaPipelineQRKSVS
                 k_dram_block_window.get_window_origin(),
                 Policy::template MakeKDramTileDistribution<Problem>()); // K DRAM tile window for
                                                                         // load
+#if CK_TILE_FMHA_FWD_SW_PREFETCH
+            k_dram_window.init_raw();
+#endif
 
-            auto k_block_tile = load_tile(k_dram_window);
+            auto k_block_tile = decltype(load_tile(k_dram_window)){};
+#if CK_TILE_FMHA_FWD_SW_PREFETCH
+            load_tile_raw(k_block_tile, k_dram_window);
+#else
+            k_block_tile = load_tile(k_dram_window);
+#endif
             {
                 move_tile_window(k_dram_window, {0, kK0});
                 clear_tile(s_acc); // initialize C
+#if CK_TILE_FMHA_FWD_SW_PREFETCH
+                buffer_load_fence(k_dram_window.get_num_of_access(), k_block_tile);
+#endif
                 store_k_tile(tile_elementwise_in(k_element_func, k_block_tile));
+#if CK_TILE_FMHA_FWD_SW_PREFETCH
+                load_tile_raw(k_block_tile, k_dram_window);
+#else
                 k_block_tile = load_tile(k_dram_window);
+#endif
             }
 
             if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
@@ -460,12 +483,27 @@ struct BlockFmhaPipelineQRKSVS
                     block_sync_lds();
                     move_tile_window(k_dram_window, {0, kK0});
 
+#if CK_TILE_FMHA_FWD_SW_PREFETCH
+                    buffer_load_fence(k_dram_window.get_num_of_access(), k_block_tile);
+#endif
                     store_k_tile(tile_elementwise_in(k_element_func, k_block_tile)); // LDS write i + 1
+#if CK_TILE_FMHA_FWD_SW_PREFETCH
+                    load_tile_raw(k_block_tile, k_dram_window);                // global read i + 2
+#else
                     k_block_tile = load_tile(k_dram_window);                // global read i + 2
+#endif
                 });
             }
 
-            const auto v_prefetch = load_tile(v_dram_window); // prefetch load v tile
+#if CK_TILE_FMHA_FWD_SW_PREFETCH_V
+            v_dram_window.init_raw();
+#endif
+            auto v_prefetch = decltype(load_tile(v_dram_window)){};
+#if CK_TILE_FMHA_FWD_SW_PREFETCH_V
+            load_tile_raw(v_prefetch, v_dram_window);
+#else
+            v_prefetch = load_tile(v_dram_window);
+#endif
             {                                                 // tail
                 block_sync_lds();
                 gemm_0(s_acc,
@@ -476,6 +514,9 @@ struct BlockFmhaPipelineQRKSVS
                 schedule_gemm0();
                 block_sync_lds();
 
+#if CK_TILE_FMHA_FWD_SW_PREFETCH
+                buffer_load_fence(k_dram_window.get_num_of_access(), k_block_tile);
+#endif
                 store_k_tile(tile_elementwise_in(k_element_func, k_block_tile));
                 block_sync_lds();
 
@@ -744,6 +785,9 @@ struct BlockFmhaPipelineQRKSVS
             }
 
             block_sync_lds();
+#if CK_TILE_FMHA_FWD_SW_PREFETCH_V
+            buffer_load_fence(v_dram_window.get_num_of_access(), v_prefetch);
+#endif
             if constexpr(std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::RowMajor>)
             {
                 auto v_shuffle_tmp = make_static_distributed_tensor<VDataType>(
@@ -793,13 +837,21 @@ struct BlockFmhaPipelineQRKSVS
             if constexpr(k1_loops > 1)
             {
                 static_for<0, k1_loops - 1, 1>{}([&](auto i_k1) {
-                    const auto v = load_tile(v_dram_window); // load next v
+                    auto v = decltype(load_tile(v_dram_window)){};
+#if CK_TILE_FMHA_FWD_SW_PREFETCH_V
+                    load_tile_raw(v, v_dram_window);
+#else
+                    v = load_tile(v_dram_window);
+#endif
                     block_sync_lds();
                     gemm_1(o_acc_,
                            get_slice_tile(
                                p, sequence<0, i_k1 * kK1>{}, sequence<kM0, (i_k1 + 1) * kK1>{}),
                            v_lds_window);
                     block_sync_lds();
+#if CK_TILE_FMHA_FWD_SW_PREFETCH_V
+                    buffer_load_fence(v_dram_window.get_num_of_access(), v);
+#endif
                     if constexpr(std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::RowMajor>)
                     {
                         auto v_shuffle_tmp = make_static_distributed_tensor<VDataType>(

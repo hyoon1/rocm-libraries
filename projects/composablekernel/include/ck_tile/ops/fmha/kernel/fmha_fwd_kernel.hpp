@@ -111,6 +111,10 @@ struct FmhaFwdKernel
         ck_tile::index_t nhead_stride_k;
         ck_tile::index_t nhead_stride_v;
         ck_tile::index_t nhead_stride_o;
+
+        // Optional global head count and head offset (for grouped launches & RNG correctness)
+        ck_tile::index_t num_head_q_total = 0;
+        ck_tile::index_t head_start        = 0;
     };
 
     struct FmhaFwdLogitsSoftCapKargs
@@ -382,7 +386,9 @@ struct FmhaFwdKernel
                   ck_tile::index_t block_scale_size_kv,
                   const void* cu_seqlen_q_ptr = nullptr,
                   const void* cu_seqlen_k_ptr = nullptr,
-                  const void* sink_ptr        = nullptr)
+                  const void* sink_ptr        = nullptr,
+                  ck_tile::index_t num_head_q_total = 0,
+                  ck_tile::index_t head_start        = 0)
     {
         Kargs kargs{{q_ptr,
                      k_ptr,
@@ -418,6 +424,8 @@ struct FmhaFwdKernel
                     batch_stride_k,
                     batch_stride_v,
                     batch_stride_o};
+        kargs.num_head_q_total = num_head_q_total;
+        kargs.head_start        = head_start;
 
         if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
         {
@@ -789,7 +797,9 @@ struct FmhaFwdKernel
                   ck_tile::index_t block_scale_size_kv,
                   const void* cu_seqlen_q_ptr = nullptr,
                   const void* cu_seqlen_k_ptr = nullptr,
-                  const void* sink_ptr        = nullptr)
+                  const void* sink_ptr        = nullptr,
+                  ck_tile::index_t num_head_q_total = 0,
+                  ck_tile::index_t head_start        = 0)
     {
         Kargs kargs{{q_ptr,
                      k_ptr,
@@ -826,6 +836,8 @@ struct FmhaFwdKernel
                     reinterpret_cast<const int32_t*>(seqstart_k_ptr),
                     reinterpret_cast<const int32_t*>(seqlen_q_ptr),
                     reinterpret_cast<const int32_t*>(seqlen_k_ptr)};
+        kargs.num_head_q_total = num_head_q_total;
+        kargs.head_start        = head_start;
 
         if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
         {
@@ -1575,9 +1587,12 @@ struct FmhaFwdKernel
             auto dropout = [&, i_nhead_ = i_nhead, i_batch_ = i_batch]() {
                 if constexpr(kHasDropout)
                 {
+                    const auto num_head_q_total =
+                        (kargs.num_head_q_total > 0 ? kargs.num_head_q_total : kargs.num_head_q);
+                    const auto i_head_global = kargs.head_start + i_nhead_;
                     return BlockDropout{i_batch_,
-                                        i_nhead_,
-                                        kargs.num_head_q,
+                                        i_head_global,
+                                        num_head_q_total,
                                         kargs.is_drop_seed_offset_from_host ? kargs.drop_seed.val
                                                                             : *kargs.drop_seed.ptr,
                                         kargs.is_drop_seed_offset_from_host
