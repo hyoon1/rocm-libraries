@@ -20,28 +20,6 @@
 
 namespace ck_tile {
 
-namespace fmha_detail {
-template <index_t NDimY>
-using y_shuffle_swap_last_two_t = decltype(typename arithmetic_sequence_gen<0, NDimY - 2, 1>::type{}
-                                              .push_back(number<NDimY - 1>{})
-                                              .push_back(number<NDimY - 2>{}));
-
-template <typename InTensor>
-CK_TILE_DEVICE auto in_thread_transpose_for_lds_store(const InTensor& in_tensor)
-{
-    using InDstrEncode = typename InTensor::StaticTileDistribution::DstrEncode;
-    static_assert(InDstrEncode::NDimY >= 2, "in-thread transpose requires >= 2 Y dims");
-
-    using Shuffle     = y_shuffle_swap_last_two_t<InDstrEncode::NDimY>;
-    using OutDstrEncode = tile_distribution_encoding_shuffle_t<InDstrEncode, Shuffle>;
-
-    auto out_tensor = make_static_distributed_tensor<typename InTensor::DataType>(
-        make_static_tile_distribution(OutDstrEncode{}));
-    shuffle_tile(out_tensor, in_tensor);
-    return out_tensor;
-}
-} // namespace fmha_detail
-
 // This pipeline is qkv all located in LDS
 template <typename Problem_, typename Policy_ = BlockFmhaPipelineQRKSVSDefaultPolicy>
 struct BlockFmhaPipelineQRKSVS
@@ -396,28 +374,6 @@ struct BlockFmhaPipelineQRKSVS
         static_assert(2 <= k0_loops);
         static_assert(1 <= k1_loops);
 
-        const auto store_k_tile = [&](const auto& k_reg_tile) {
-            if constexpr(CK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE && sizeof(KDataType) == 2)
-            {
-                store_tile(k_lds_window, fmha_detail::in_thread_transpose_for_lds_store(k_reg_tile));
-            }
-            else
-            {
-                store_tile(k_lds_window, k_reg_tile);
-            }
-        };
-
-        const auto store_v_tile = [&](const auto& v_reg_tile) {
-            if constexpr(CK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE && sizeof(VDataType) == 2)
-            {
-                store_tile(v_lds_window, fmha_detail::in_thread_transpose_for_lds_store(v_reg_tile));
-            }
-            else
-            {
-                store_tile(v_lds_window, v_reg_tile);
-            }
-        };
-
         do
         {
             float k_descale = 1.0f;
@@ -450,7 +406,7 @@ struct BlockFmhaPipelineQRKSVS
 #if CK_TILE_FMHA_FWD_SW_PREFETCH
                 buffer_load_fence(k_dram_window.get_num_of_access(), k_block_tile);
 #endif
-                store_k_tile(tile_elementwise_in(k_element_func, k_block_tile));
+                store_tile(k_lds_window, tile_elementwise_in(k_element_func, k_block_tile));
 #if CK_TILE_FMHA_FWD_SW_PREFETCH
                 load_tile_raw(k_block_tile, k_dram_window);
 #else
@@ -486,7 +442,9 @@ struct BlockFmhaPipelineQRKSVS
 #if CK_TILE_FMHA_FWD_SW_PREFETCH
                     buffer_load_fence(k_dram_window.get_num_of_access(), k_block_tile);
 #endif
-                    store_k_tile(tile_elementwise_in(k_element_func, k_block_tile)); // LDS write i + 1
+                    store_tile(
+                        k_lds_window,
+                        tile_elementwise_in(k_element_func, k_block_tile)); // LDS write i + 1
 #if CK_TILE_FMHA_FWD_SW_PREFETCH
                     load_tile_raw(k_block_tile, k_dram_window);                // global read i + 2
 #else
@@ -517,7 +475,7 @@ struct BlockFmhaPipelineQRKSVS
 #if CK_TILE_FMHA_FWD_SW_PREFETCH
                 buffer_load_fence(k_dram_window.get_num_of_access(), k_block_tile);
 #endif
-                store_k_tile(tile_elementwise_in(k_element_func, k_block_tile));
+                store_tile(k_lds_window, tile_elementwise_in(k_element_func, k_block_tile));
                 block_sync_lds();
 
                 gemm_0(s_acc,
@@ -798,7 +756,8 @@ struct BlockFmhaPipelineQRKSVS
             }
             else
             {
-                store_v_tile(tile_elementwise_in(v_element_func, v_prefetch)); // store the prefetch
+                store_tile(v_lds_window,
+                           tile_elementwise_in(v_element_func, v_prefetch)); // store the prefetch
             }
 
             move_tile_window(v_dram_window, {0, kK1});
@@ -863,7 +822,8 @@ struct BlockFmhaPipelineQRKSVS
                     }
                     else
                     {
-                        store_v_tile(tile_elementwise_in(v_element_func, v)); // store next v
+                        store_tile(v_lds_window,
+                                   tile_elementwise_in(v_element_func, v)); // store next v
                     }
                     move_tile_window(v_dram_window, {0, kK1});
                 });

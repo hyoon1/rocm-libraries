@@ -187,16 +187,6 @@ else()
 endif()
 list(APPEND FMHA_BWD_PRIVATE_COMPILE_OPTIONS -fgpu-flush-denormals-to-zero)
 
-# Triton-inspired in-thread transpose optimization (compile-time switch).
-option(FMHA_FWD_IN_THREAD_TRANSPOSE "Enable CK Tile FMHA in-thread transpose optimization" OFF)
-if(FMHA_FWD_IN_THREAD_TRANSPOSE)
-  list(APPEND FMHA_FWD_PRIVATE_COMPILE_OPTIONS -DCK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE=1)
-  list(APPEND FMHA_FWD_INTERFACE_COMPILE_OPTIONS -DCK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE=1)
-else()
-  list(APPEND FMHA_FWD_PRIVATE_COMPILE_OPTIONS -DCK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE=0)
-  list(APPEND FMHA_FWD_INTERFACE_COMPILE_OPTIONS -DCK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE=0)
-endif()
-
 # Software prefetch via raw loads and delayed waitcnt in sync pipeline.
 option(FMHA_FWD_SW_PREFETCH "Enable CK Tile FMHA software prefetch in sync pipeline" OFF)
 if(FMHA_FWD_SW_PREFETCH)

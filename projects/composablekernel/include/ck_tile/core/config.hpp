@@ -242,12 +242,6 @@
 #define CK_TILE_FMHA_FLOAT_TO_FLOAT16_RTN 0
 #endif
 
-// Triton-inspired optimization knob: allow in-thread transpose to improve FMHA LDS store/load
-// efficiency on some architectures.
-#ifndef CK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE
-#define CK_TILE_FMHA_USE_IN_THREAD_TRANSPOSE 0
-#endif
-
 #ifndef CK_TILE_BUFFER_LOAD_RAW_BF16_WA
 #define CK_TILE_BUFFER_LOAD_RAW_BF16_WA 1
 #endif
