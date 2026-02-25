@@ -111,10 +111,6 @@ struct FmhaFwdKernel
         ck_tile::index_t nhead_stride_k;
         ck_tile::index_t nhead_stride_v;
         ck_tile::index_t nhead_stride_o;
-
-        // Optional global head count and head offset (for grouped launches & RNG correctness)
-        ck_tile::index_t num_head_q_total = 0;
-        ck_tile::index_t head_start        = 0;
     };
 
     struct FmhaFwdLogitsSoftCapKargs
@@ -386,9 +382,7 @@ struct FmhaFwdKernel
                   ck_tile::index_t block_scale_size_kv,
                   const void* cu_seqlen_q_ptr = nullptr,
                   const void* cu_seqlen_k_ptr = nullptr,
-                  const void* sink_ptr        = nullptr,
-                  ck_tile::index_t num_head_q_total = 0,
-                  ck_tile::index_t head_start        = 0)
+                  const void* sink_ptr        = nullptr)
     {
         Kargs kargs{{q_ptr,
                      k_ptr,
@@ -424,8 +418,6 @@ struct FmhaFwdKernel
                     batch_stride_k,
                     batch_stride_v,
                     batch_stride_o};
-        kargs.num_head_q_total = num_head_q_total;
-        kargs.head_start        = head_start;
 
         if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
         {
@@ -797,9 +789,7 @@ struct FmhaFwdKernel
                   ck_tile::index_t block_scale_size_kv,
                   const void* cu_seqlen_q_ptr = nullptr,
                   const void* cu_seqlen_k_ptr = nullptr,
-                  const void* sink_ptr        = nullptr,
-                  ck_tile::index_t num_head_q_total = 0,
-                  ck_tile::index_t head_start        = 0)
+                  const void* sink_ptr        = nullptr)
     {
         Kargs kargs{{q_ptr,
                      k_ptr,
@@ -836,8 +826,6 @@ struct FmhaFwdKernel
                     reinterpret_cast<const int32_t*>(seqstart_k_ptr),
                     reinterpret_cast<const int32_t*>(seqlen_q_ptr),
                     reinterpret_cast<const int32_t*>(seqlen_k_ptr)};
-        kargs.num_head_q_total = num_head_q_total;
-        kargs.head_start        = head_start;
 
         if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
         {
@@ -1170,6 +1158,38 @@ struct FmhaFwdKernel
         if constexpr(kIsGroupMode)
             has_padded_seqlen_k = (kargs.seqlen_k_ptr != nullptr);
 
+#if !defined(CK_TILE_FMHA_FORCE_HEAD_MAJOR)
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx11__) || defined(__gfx12__))
+#define CK_TILE_FMHA_FORCE_HEAD_MAJOR 1
+#else
+#define CK_TILE_FMHA_FORCE_HEAD_MAJOR 0
+#endif
+#endif
+
+#if CK_TILE_FMHA_FORCE_HEAD_MAJOR
+        const index_t num_tile_n1 =
+            ck_tile::integer_divide_ceil(kargs.hdim_v, FmhaPipeline::kN1);
+        const index_t num_tile_total = has_padded_seqlen_k ? gridDim.z : gridDim.y;
+        const index_t num_head        = gridDim.x;
+        const index_t blocks_per_batch = num_head * num_tile_total;
+        const index_t linear_id =
+            blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+
+        const index_t i_batch = linear_id / blocks_per_batch;
+        const index_t rem0    = linear_id - i_batch * blocks_per_batch;
+        const index_t i_nhead = rem0 / num_tile_total;
+        const index_t i_block = rem0 - i_nhead * num_tile_total;
+
+        index_t i_tile_m = i_block / num_tile_n1;
+        index_t i_tile_n = i_block - i_tile_m * num_tile_n1;
+
+        if constexpr(kHasMask)
+        {
+            const index_t num_tile_m = num_tile_total / num_tile_n1;
+            i_tile_m                 = num_tile_m - 1 - i_tile_m;
+        }
+        return ck_tile::make_tuple(i_tile_m, i_tile_n, i_nhead, i_batch);
+#else
         if(has_padded_seqlen_k)
         {
             // const index_t num_tile_m0 = seqlen_q / kM0;
@@ -1226,6 +1246,7 @@ struct FmhaFwdKernel
                 return ck_tile::make_tuple(i_tile_m, i_tile_n, i_nhead, i_batch);
             }
         }
+#endif
     }
 
     CK_TILE_HOST static dim3 BlockSize()
@@ -1587,9 +1608,8 @@ struct FmhaFwdKernel
             auto dropout = [&, i_nhead_ = i_nhead, i_batch_ = i_batch]() {
                 if constexpr(kHasDropout)
                 {
-                    const auto num_head_q_total =
-                        (kargs.num_head_q_total > 0 ? kargs.num_head_q_total : kargs.num_head_q);
-                    const auto i_head_global = kargs.head_start + i_nhead_;
+                    const auto num_head_q_total = kargs.num_head_q;
+                    const auto i_head_global    = i_nhead_;
                     return BlockDropout{i_batch_,
                                         i_head_global,
                                         num_head_q_total,
