@@ -15,6 +15,7 @@
 #include <functional>
 #include <cmath>
 #include <numeric>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <tuple>
@@ -32,6 +33,169 @@ enum class fwd_result
     invalid_args,
     no_instance,
 };
+
+inline bool ck_tile_head_group_log_enabled()
+{
+    const char* env = std::getenv("CK_TILE_FMHA_HEAD_GROUP_LOG");
+    return env != nullptr && std::atoi(env) == 1;
+}
+
+inline bool ck_tile_head_grouping_disabled_by_env()
+{
+    const char* env_disable = std::getenv("CK_TILE_FMHA_DISABLE_HEAD_GROUPING");
+    if(env_disable != nullptr && std::atoi(env_disable) == 1)
+        return true;
+    env_disable = std::getenv("FLASH_ATTN_DISABLE_HEAD_GROUPING");
+    if(env_disable != nullptr && std::atoi(env_disable) == 1)
+        return true;
+    return false;
+}
+
+inline size_t ck_tile_get_llc_cache_bytes(const std::string& arch)
+{
+    const char* env_llc_mb = std::getenv("CK_TILE_FMHA_LLC_CACHE_MB");
+    if(env_llc_mb == nullptr)
+        env_llc_mb = std::getenv("FLASH_ATTN_LLC_CACHE_MB");
+    if(env_llc_mb == nullptr)
+        env_llc_mb = std::getenv("FLASH_ATTN_L2_CACHE_MB"); // legacy alias in triton
+    if(env_llc_mb != nullptr)
+    {
+        const int mb = std::atoi(env_llc_mb);
+        if(mb > 0)
+            return static_cast<size_t>(mb) * 1024ull * 1024ull;
+    }
+
+    // Known sizes (bytes)
+    if(arch == "gfx1030")
+        return 128ull * 1024ull * 1024ull;
+    if(arch == "gfx1100")
+        return 96ull * 1024ull * 1024ull;
+    if(arch == "gfx1101")
+        return 64ull * 1024ull * 1024ull;
+    if(arch == "gfx1102")
+        return 32ull * 1024ull * 1024ull;
+    if(arch == "gfx1150")
+        return 32ull * 1024ull * 1024ull;
+    if(arch == "gfx1151")
+        return 32ull * 1024ull * 1024ull;
+    if(arch == "gfx1200")
+        return 32ull * 1024ull * 1024ull;
+    if(arch == "gfx1201")
+        return 64ull * 1024ull * 1024ull;
+
+    // Reasonable defaults by family
+    if(arch.rfind("gfx10", 0) == 0)
+        return 128ull * 1024ull * 1024ull;
+    if(arch.rfind("gfx11", 0) == 0)
+        return 96ull * 1024ull * 1024ull;
+    if(arch.rfind("gfx12", 0) == 0)
+        return 64ull * 1024ull * 1024ull;
+
+    return 0; // unknown
+}
+
+inline bool ck_tile_is_rdna_arch(const std::string& arch)
+{
+    return arch.rfind("gfx10", 0) == 0 || arch.rfind("gfx11", 0) == 0 ||
+           arch.rfind("gfx12", 0) == 0;
+}
+
+inline std::optional<ck_tile::index_t> ck_tile_get_head_group_size(
+    ck_tile::index_t nhead_q,
+    ck_tile::index_t nhead_k,
+    ck_tile::index_t batch,
+    ck_tile::index_t seqlen_k,
+    ck_tile::index_t hdim_q,
+    ck_tile::index_t hdim_v,
+    size_t elem_bytes_k,
+    size_t elem_bytes_v)
+{
+    if(ck_tile_head_grouping_disabled_by_env())
+        return std::nullopt;
+
+    // Manual override
+    const char* env_group = std::getenv("CK_TILE_FMHA_HEAD_GROUP_SIZE");
+    if(env_group != nullptr)
+    {
+        const int g = std::atoi(env_group);
+        if(g > 0)
+        {
+            if(nhead_k <= 0 || nhead_q <= 0 || (nhead_q % nhead_k) != 0)
+                return std::nullopt;
+            const ck_tile::index_t gqa_ratio = nhead_q / nhead_k;
+            ck_tile::index_t forced_group    = static_cast<ck_tile::index_t>(std::min<int>(g, nhead_q));
+            if(gqa_ratio > 1)
+            {
+                const ck_tile::index_t min_group_aligned =
+                    ((forced_group + gqa_ratio - 1) / gqa_ratio) * gqa_ratio;
+                forced_group = min_group_aligned;
+            }
+            forced_group = std::min(forced_group, nhead_q);
+            if(forced_group >= nhead_q)
+                return std::nullopt;
+            return forced_group;
+        }
+    }
+
+    const std::string arch = ck_tile::get_device_name();
+    if(arch.empty() || !ck_tile_is_rdna_arch(arch))
+        return std::nullopt;
+
+    const size_t llc_bytes = ck_tile_get_llc_cache_bytes(arch);
+    if(llc_bytes == 0)
+        return std::nullopt;
+
+    if(nhead_k <= 0 || nhead_q <= 0 || (nhead_q % nhead_k) != 0)
+        return std::nullopt;
+
+    if(seqlen_k <= 0 || hdim_q <= 0 || hdim_v <= 0 || batch <= 0)
+        return std::nullopt;
+
+    const size_t kv_bytes_per_head =
+        static_cast<size_t>(seqlen_k) *
+        (static_cast<size_t>(hdim_q) * elem_bytes_k + static_cast<size_t>(hdim_v) * elem_bytes_v);
+    if(kv_bytes_per_head == 0)
+        return std::nullopt;
+
+    const size_t target_bytes = static_cast<size_t>(llc_bytes * 8 / 10); // 80% LLC budget
+    const size_t bytes_per_group = kv_bytes_per_head * static_cast<size_t>(batch);
+    if(bytes_per_group == 0)
+        return std::nullopt;
+
+    ck_tile::index_t group = static_cast<ck_tile::index_t>(target_bytes / bytes_per_group);
+    if(group < 1)
+        group = 1;
+
+    const ck_tile::index_t gqa_ratio = nhead_q / nhead_k;
+    if(gqa_ratio > 1)
+    {
+        const ck_tile::index_t min_group_aligned =
+            ((group + gqa_ratio - 1) / gqa_ratio) * gqa_ratio;
+        group = min_group_aligned;
+    }
+
+    group = std::min(group, nhead_q);
+    if(group >= nhead_q)
+        return std::nullopt;
+
+    return group;
+}
+
+template <typename T>
+inline const void* ck_tile_ptr_offset(const void* base, ck_tile::index_t offset_elems)
+{
+    if(base == nullptr)
+        return nullptr;
+    return static_cast<const void*>(reinterpret_cast<const T*>(base) + offset_elems);
+}
+
+template <typename T>
+inline void* ck_tile_ptr_offset(void* base, ck_tile::index_t offset_elems)
+{
+    if(base == nullptr)
+        return nullptr;
+    return static_cast<void*>(reinterpret_cast<T*>(base) + offset_elems);
+}
 
 // different threshold for different dtype
 template <typename DataTypeConfig>
@@ -1076,6 +1240,11 @@ fwd_result fmha_fwd_run(mode_enum mode,
         args.hdim_v   = hdim_v;
         args.nhead_q  = nhead;
         args.nhead_k  = nhead_k;
+        if constexpr(std::is_same_v<fmha_fwd_args, std::decay_t<decltype(args)>>)
+        {
+            args.num_head_q_total = nhead;
+            args.head_start        = 0;
+        }
 
         args.stride_q       = stride_q;
         args.stride_k       = stride_k;
@@ -1367,7 +1536,135 @@ fwd_result fmha_fwd_run(mode_enum mode,
         return fmha_fwd(fmha_traits, fmha_args, sc);
     };
 
-    float fwd_ave_time = run_fwd(stream_config);
+    auto run_fwd_head_grouped =
+        [&](const ck_tile::stream_config& sc, ck_tile::index_t group_size_q) {
+            fmha_fwd_traits fmha_traits;
+            init_traits(fmha_traits);
+
+            fmha_fwd_args base_args;
+            init_args(base_args);
+            base_args.num_head_q_total = nhead;
+
+            const ck_tile::index_t gqa_ratio = (nhead_k > 0 ? (nhead / nhead_k) : 1);
+            const ck_tile::index_t group_sz  = std::min(group_size_q, nhead);
+            const ck_tile::index_t n_groups  = ck_tile::integer_divide_ceil(nhead, group_sz);
+
+            float total_time = 0.0f;
+            bool first_group = true;
+            for(ck_tile::index_t head_start = 0; head_start < nhead; head_start += group_sz)
+            {
+                const ck_tile::index_t q_heads = std::min(group_sz, nhead - head_start);
+                const ck_tile::index_t k_head_start =
+                    (gqa_ratio > 0 ? head_start / gqa_ratio : head_start);
+                const ck_tile::index_t k_heads = (gqa_ratio > 0 ? q_heads / gqa_ratio : q_heads);
+
+                auto args        = base_args;
+                args.nhead_q     = q_heads;
+                args.nhead_k     = k_heads;
+                args.head_start  = head_start;
+
+                args.q_ptr = ck_tile_ptr_offset<QDataType>(
+                    base_args.q_ptr, head_start * base_args.nhead_stride_q);
+                args.k_ptr = ck_tile_ptr_offset<KDataType>(
+                    base_args.k_ptr, k_head_start * base_args.nhead_stride_k);
+                args.v_ptr = ck_tile_ptr_offset<VDataType>(
+                    base_args.v_ptr, k_head_start * base_args.nhead_stride_v);
+                args.o_ptr = ck_tile_ptr_offset<ODataType>(
+                    base_args.o_ptr, head_start * base_args.nhead_stride_o);
+
+                args.bias_ptr = ck_tile_ptr_offset<BiasDataType>(
+                    base_args.bias_ptr, head_start * base_args.nhead_stride_bias);
+                args.lse_ptr = ck_tile_ptr_offset<LSEDataType>(
+                    base_args.lse_ptr, head_start * base_args.nhead_stride_lse);
+                args.rand_val_ptr = ck_tile_ptr_offset<RandValOutputDataType>(
+                    base_args.rand_val_ptr, head_start * base_args.nhead_stride_randval);
+
+                args.q_descale_ptr = ck_tile_ptr_offset<float>(
+                    base_args.q_descale_ptr, head_start * base_args.nhead_stride_q_descale);
+                args.k_descale_ptr = ck_tile_ptr_offset<float>(
+                    base_args.k_descale_ptr, k_head_start * base_args.nhead_stride_k_descale);
+                args.v_descale_ptr = ck_tile_ptr_offset<float>(
+                    base_args.v_descale_ptr, k_head_start * base_args.nhead_stride_v_descale);
+
+                args.sink_ptr = ck_tile_ptr_offset<float>(base_args.sink_ptr, head_start);
+
+                if(ck_tile_head_group_log_enabled())
+                {
+                    const ck_tile::index_t head_end = head_start + q_heads;
+                    std::cout << "[LLC Head Grouping] group "
+                              << (first_group ? 0 : (head_start / group_sz)) << "/"
+                              << n_groups << " heads_q=[" << head_start << ", " << head_end
+                              << ") heads_k=[" << k_head_start << ", " << (k_head_start + k_heads)
+                              << ")" << std::endl;
+                }
+
+                const float t = fmha_fwd(fmha_traits, args, sc);
+                if(t < 0.0f)
+                    return t;
+                total_time += t;
+                first_group = false;
+            }
+            return total_time;
+        };
+
+    float fwd_ave_time = -1.0f;
+    const bool allow_head_grouping =
+        !use_kvcache && (num_splits <= 1) && !need_append_kvcache &&
+        (mode == mode_enum::batch || mode == mode_enum::group);
+
+    if(allow_head_grouping)
+    {
+        if(ck_tile_head_grouping_disabled_by_env())
+        {
+            if(ck_tile_head_group_log_enabled())
+                std::cout << "[LLC Head Grouping] disabled by env" << std::endl;
+        }
+        else
+        {
+            const auto group_size_opt = ck_tile_get_head_group_size(
+                nhead,
+                nhead_k,
+                batch,
+                max_seqlen_k,
+                hdim_q,
+                hdim_v,
+                sizeof(KDataType),
+                sizeof(VDataType));
+
+            if(group_size_opt.has_value() && group_size_opt.value() < nhead)
+            {
+                if(ck_tile_head_group_log_enabled())
+                {
+                    const std::string arch = ck_tile::get_device_name();
+                    const size_t llc_bytes = ck_tile_get_llc_cache_bytes(arch);
+                    const ck_tile::index_t gqa_ratio = (nhead_k > 0 ? (nhead / nhead_k) : 1);
+                    const ck_tile::index_t group_sz  = group_size_opt.value();
+                    const ck_tile::index_t n_groups =
+                        ck_tile::integer_divide_ceil(nhead, group_sz);
+                    std::cout << "[LLC Head Grouping] enabled" << std::endl;
+                    std::cout << "[LLC Head Grouping] arch=" << (arch.empty() ? "unknown" : arch)
+                              << " llc_mb=" << (llc_bytes / (1024ull * 1024ull))
+                              << " nhead_q=" << nhead << " nhead_k=" << nhead_k
+                              << " gqa_ratio=" << gqa_ratio << " group_size=" << group_sz
+                              << " groups=" << n_groups << std::endl;
+                }
+                fwd_ave_time = run_fwd_head_grouped(stream_config, group_size_opt.value());
+            }
+            else if(ck_tile_head_group_log_enabled())
+            {
+                std::cout << "[LLC Head Grouping] skipped (group_size not set or >= nhead)"
+                          << std::endl;
+            }
+        }
+    }
+    else if(ck_tile_head_group_log_enabled())
+    {
+        std::cout << "[LLC Head Grouping] disabled by conditions (kvcache/splits/appendkv/mode)"
+                  << std::endl;
+    }
+
+    if(fwd_ave_time < 0.0f)
+        fwd_ave_time = run_fwd(stream_config);
     if(fwd_ave_time < 0.0f)
     {
         std::cout << ", not supported yet" << std::flush << std::endl;
