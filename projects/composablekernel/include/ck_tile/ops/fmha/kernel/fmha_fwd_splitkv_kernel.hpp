@@ -559,43 +559,6 @@ struct FmhaFwdSplitKVKernel
     CK_TILE_DEVICE static constexpr auto GetTileIndex(const Kargs& kargs)
     {
         const index_t num_tile_n1 = ck_tile::integer_divide_ceil(kargs.hdim_v, FmhaPipeline::kN1);
-#if !defined(CK_TILE_FMHA_FORCE_HEAD_MAJOR)
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx11__) || defined(__gfx12__))
-#define CK_TILE_FMHA_FORCE_HEAD_MAJOR 1
-#else
-#define CK_TILE_FMHA_FORCE_HEAD_MAJOR 0
-#endif
-#endif
-
-#if CK_TILE_FMHA_FORCE_HEAD_MAJOR
-        const index_t num_block        = gridDim.x;
-        const index_t num_head         = gridDim.y;
-        const index_t blocks_per_batch = num_head * num_block;
-        const index_t linear_id =
-            blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
-
-        const index_t i_batch = linear_id / blocks_per_batch;
-        const index_t rem0    = linear_id - i_batch * blocks_per_batch;
-        const index_t i_nhead = rem0 / num_block;
-        const index_t i_block = rem0 - i_nhead * num_block;
-
-        const auto f = [](index_t dividend, index_t divisor) {
-            index_t quotient = dividend / divisor;
-            index_t modulus  = dividend - quotient * divisor;
-            return ck_tile::make_tuple(quotient, modulus);
-        };
-
-        const auto [mn, i_split]  = f(i_block, kargs.num_splits);
-        auto [i_tile_m, i_tile_n] = f(mn, num_tile_n1);
-
-        if constexpr(kHasMask)
-        {
-            const index_t num_tile_total = num_block / kargs.num_splits;
-            const index_t num_tile_m     = num_tile_total / num_tile_n1;
-            i_tile_m                     = num_tile_m - 1 - i_tile_m;
-        }
-        return ck_tile::make_tuple(i_tile_m, i_tile_n, i_split, i_nhead, i_batch);
-#else
 
         const auto f = [](index_t dividend, index_t divisor) {
             index_t quotient = dividend / divisor;
@@ -618,7 +581,6 @@ struct FmhaFwdSplitKVKernel
         {
             return ck_tile::make_tuple(i_tile_m, i_tile_n, i_split, i_nhead, i_batch);
         }
-#endif
     }
 
     CK_TILE_HOST static dim3 BlockSize()
