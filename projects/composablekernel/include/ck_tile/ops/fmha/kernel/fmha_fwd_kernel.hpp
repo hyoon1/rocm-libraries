@@ -1248,7 +1248,8 @@ struct FmhaFwdKernel
             if constexpr(kHasMask)
             {
                 // assume that num_tile_n1 is always 1
-                return ck_tile::make_tuple(gridDim.z - 1 - i_tile_m, i_tile_n, i_nhead, i_batch);
+                return ck_tile::make_tuple(
+                    static_cast<index_t>(gridDim.z) - 1 - i_tile_m, i_tile_n, i_nhead, i_batch);
             }
             else
             {
@@ -1276,7 +1277,8 @@ struct FmhaFwdKernel
             if constexpr(kHasMask)
             {
                 // assume that num_tile_n1 is always 1
-                return ck_tile::make_tuple(gridDim.y - 1 - i_tile_m, i_tile_n, i_nhead, i_batch);
+                return ck_tile::make_tuple(
+                    static_cast<index_t>(gridDim.y) - 1 - i_tile_m, i_tile_n, i_nhead, i_batch);
             }
             else
             {
