@@ -268,20 +268,21 @@ inline std::optional<ck_tile::index_t> get_head_group_size(ck_tile::index_t nhea
     if(kv_bytes_per_head == 0)
         return std::nullopt;
 
-    // Match Triton LLC-aware policy:
-    // - llc_utilization = 1.0
-    // - threshold_ratio = 1.5
-    // - min_group_size  = nheads // 16
-    constexpr long double kLlcUtilization = 1.0L;
+    // Hybrid policy:
+    // - large LLC GPUs (>= 64MB): slightly more cache-resident grouping (CK-like)
+    // - smaller LLC GPUs: Triton policy
+    constexpr size_t kLargeLlcThresholdBytes = 64ull * 1024ull * 1024ull;
+    const bool is_large_llc                 = llc_bytes >= kLargeLlcThresholdBytes;
+    const long double llc_utilization       = is_large_llc ? 0.85L : 1.0L;
+    const long double threshold_ratio       = is_large_llc ? 1.3L : 1.5L;
     const size_t target_llc_bytes =
-        static_cast<size_t>(static_cast<long double>(llc_bytes) * kLlcUtilization);
+        static_cast<size_t>(static_cast<long double>(llc_bytes) * llc_utilization);
     if(target_llc_bytes == 0)
         return std::nullopt;
 
     const size_t total_kv_bytes = static_cast<size_t>(nhead_q) * kv_bytes_per_head;
-    constexpr long double kThresholdRatio = 1.5L;
     if(static_cast<long double>(total_kv_bytes) <
-       static_cast<long double>(target_llc_bytes) * kThresholdRatio)
+       static_cast<long double>(target_llc_bytes) * threshold_ratio)
         return std::nullopt;
 
     ck_tile::index_t group = static_cast<ck_tile::index_t>(target_llc_bytes / kv_bytes_per_head);
@@ -291,6 +292,13 @@ inline std::optional<ck_tile::index_t> get_head_group_size(ck_tile::index_t nhea
     const ck_tile::index_t min_group_size = std::max<ck_tile::index_t>(1, nhead_q / 16);
     if(group < min_group_size)
         group = min_group_size;
+
+    // Keep launch overhead bounded: avoid too many tiny groups.
+    constexpr ck_tile::index_t kMaxGroups = 12;
+    const ck_tile::index_t min_group_for_max_groups =
+        ck_tile::integer_divide_ceil(nhead_q, kMaxGroups);
+    if(group < min_group_for_max_groups)
+        group = min_group_for_max_groups;
 
     const ck_tile::index_t gqa_ratio = nhead_q / nhead_k;
     if(gqa_ratio > 1)
