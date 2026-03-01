@@ -293,8 +293,8 @@ inline std::optional<ck_tile::index_t> get_head_group_size(ck_tile::index_t nhea
     if(group < min_group_size)
         group = min_group_size;
 
-    // Keep launch overhead bounded: avoid too many tiny groups.
-    constexpr ck_tile::index_t kMaxGroups = 12;
+    // Cap the number of groups to avoid excessive launch overhead.
+    constexpr ck_tile::index_t kMaxGroups = 8;
     const ck_tile::index_t min_group_for_max_groups =
         ck_tile::integer_divide_ceil(nhead_q, kMaxGroups);
     if(group < min_group_for_max_groups)

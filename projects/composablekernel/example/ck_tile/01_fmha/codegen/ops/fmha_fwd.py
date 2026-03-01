@@ -1103,9 +1103,8 @@ class KernelComponentFactoryGfx950(
 class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
     arch = ArchTrait(
         "gfx11",
-        # gfx115x also defines __gfx11__, so exclude it here to avoid generating duplicate
-        # specializations when building a multi-arch binary (gfx110x + gfx115x).
-        preprocessor_check="defined(__gfx11__) && !(defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__))",
+        # Treat gfx115x as gfx11 for codegen/dispatch policy.
+        preprocessor_check="defined(__gfx11__)",
     )
 
     _DT_FP16_BF16 = ("fp16", "bf16")
@@ -1183,23 +1182,6 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
                 pipelines.append(FmhaFwdPipeline("qr", "row", "t", "f", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr", "row", "t", "t", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
         return pipelines
-
-
-class KernelComponentFactoryGfx115(KernelComponentFactoryGfx11):
-    arch = ArchTrait(
-        "gfx115",
-        preprocessor_check="defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)",
-    )
-
-    @classmethod
-    def get_hdim_tile_size_dict(cls, dtype: str) -> Optional[dict]:
-        result = KernelComponentFactoryGfx11.get_hdim_tile_size_dict(dtype)
-        if dtype in cls._DT_FP16_BF16 and (128, 128) in result:
-            # gfx115x: let the pipeline decide occupancy (better perf than forcing _o6 on some parts).
-            for tile in result[(128, 128)]:
-                if tile.F_bm0 == 128 and tile.F_bn0 == 64:
-                    tile.F_occupancy = -1
-        return result
 
 
 class KernelComponentFactoryGfx12(CompatibilityRuleFactory):
@@ -1291,8 +1273,6 @@ def get_factory(target: str):
     if target.startswith("gfx9"):
         return KernelComponentFactoryGfx9
 
-    if target.startswith("gfx115"):
-        return KernelComponentFactoryGfx115
     if target.startswith("gfx11"):
         return KernelComponentFactoryGfx11
     if target.startswith("gfx12"):
