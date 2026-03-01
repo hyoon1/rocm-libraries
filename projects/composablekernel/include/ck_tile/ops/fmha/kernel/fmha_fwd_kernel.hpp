@@ -112,6 +112,10 @@ struct FmhaFwdKernel
         ck_tile::index_t nhead_stride_v;
         ck_tile::index_t nhead_stride_o;
 
+        // Optional global head count and head offset (for grouped launches & RNG correctness)
+        ck_tile::index_t num_head_q_total = 0;
+        ck_tile::index_t head_start       = 0;
+
     };
 
     struct FmhaFwdLogitsSoftCapKargs
@@ -383,7 +387,9 @@ struct FmhaFwdKernel
                   ck_tile::index_t block_scale_size_kv,
                   const void* cu_seqlen_q_ptr = nullptr,
                   const void* cu_seqlen_k_ptr = nullptr,
-                  const void* sink_ptr        = nullptr)
+                  const void* sink_ptr        = nullptr,
+                  ck_tile::index_t num_head_q_total = 0,
+                  ck_tile::index_t head_start       = 0)
     {
         Kargs kargs{{q_ptr,
                      k_ptr,
@@ -419,6 +425,8 @@ struct FmhaFwdKernel
                     batch_stride_k,
                     batch_stride_v,
                     batch_stride_o};
+        kargs.num_head_q_total = num_head_q_total;
+        kargs.head_start       = head_start;
 
         if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
         {
@@ -557,7 +565,9 @@ struct FmhaFwdKernel
               ck_tile::index_t block_scale_size_kv,
               const void* cu_seqlen_q_ptr = nullptr,
               const void* cu_seqlen_k_ptr = nullptr,
-              const void* sink_ptr        = nullptr)
+              const void* sink_ptr        = nullptr,
+              ck_tile::index_t num_head_q_total = 0,
+              ck_tile::index_t head_start       = 0)
     {
         return MakeKargsImpl(
             q_ptr,
@@ -615,7 +625,9 @@ struct FmhaFwdKernel
             block_scale_size_kv,
             cu_seqlen_q_ptr,
             cu_seqlen_k_ptr,
-            sink_ptr);
+            sink_ptr,
+            num_head_q_total,
+            head_start);
     }
 
     // std::variant<> can't take in a list initializer, overload for backward compatibility
@@ -676,7 +688,9 @@ struct FmhaFwdKernel
               ck_tile::index_t block_scale_size_kv,
               const void* cu_seqlen_q_ptr = nullptr,
               const void* cu_seqlen_k_ptr = nullptr,
-              const void* sink_ptr        = nullptr)
+              const void* sink_ptr        = nullptr,
+              ck_tile::index_t num_head_q_total = 0,
+              ck_tile::index_t head_start       = 0)
     {
         return MakeKargsImpl(
             q_ptr,
@@ -734,7 +748,9 @@ struct FmhaFwdKernel
             block_scale_size_kv,
             cu_seqlen_q_ptr,
             cu_seqlen_k_ptr,
-            sink_ptr);
+            sink_ptr,
+            num_head_q_total,
+            head_start);
     }
 
     template <bool Cond = kIsGroupMode>
@@ -790,7 +806,9 @@ struct FmhaFwdKernel
                   ck_tile::index_t block_scale_size_kv,
                   const void* cu_seqlen_q_ptr = nullptr,
                   const void* cu_seqlen_k_ptr = nullptr,
-                  const void* sink_ptr        = nullptr)
+                  const void* sink_ptr        = nullptr,
+                  ck_tile::index_t num_head_q_total = 0,
+                  ck_tile::index_t head_start       = 0)
     {
         Kargs kargs{{q_ptr,
                      k_ptr,
@@ -827,6 +845,8 @@ struct FmhaFwdKernel
                     reinterpret_cast<const int32_t*>(seqstart_k_ptr),
                     reinterpret_cast<const int32_t*>(seqlen_q_ptr),
                     reinterpret_cast<const int32_t*>(seqlen_k_ptr)};
+        kargs.num_head_q_total = num_head_q_total;
+        kargs.head_start       = head_start;
 
         if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
         {
@@ -962,7 +982,9 @@ struct FmhaFwdKernel
               ck_tile::index_t block_scale_size_kv,
               const void* cu_seqlen_q_ptr = nullptr,
               const void* cu_seqlen_k_ptr = nullptr,
-              const void* sink_ptr        = nullptr)
+              const void* sink_ptr        = nullptr,
+              ck_tile::index_t num_head_q_total = 0,
+              ck_tile::index_t head_start       = 0)
     {
         return MakeKargsImpl(
             q_ptr,
@@ -1015,7 +1037,9 @@ struct FmhaFwdKernel
             block_scale_size_kv,
             cu_seqlen_q_ptr,
             cu_seqlen_k_ptr,
-            sink_ptr);
+            sink_ptr,
+            num_head_q_total,
+            head_start);
     }
 
     // std::variant<> can't take in a list initializer, overload for backward compatibility
@@ -1071,7 +1095,9 @@ struct FmhaFwdKernel
               ck_tile::index_t block_scale_size_kv,
               const void* cu_seqlen_q_ptr = nullptr,
               const void* cu_seqlen_k_ptr = nullptr,
-              const void* sink_ptr        = nullptr)
+              const void* sink_ptr        = nullptr,
+              ck_tile::index_t num_head_q_total = 0,
+              ck_tile::index_t head_start       = 0)
     {
         return MakeKargsImpl(
             q_ptr,
@@ -1124,7 +1150,9 @@ struct FmhaFwdKernel
             block_scale_size_kv,
             cu_seqlen_q_ptr,
             cu_seqlen_k_ptr,
-            sink_ptr);
+            sink_ptr,
+            num_head_q_total,
+            head_start);
     }
 
     CK_TILE_HOST static constexpr auto GridSize(ck_tile::index_t batch_size_,
@@ -1168,7 +1196,10 @@ struct FmhaFwdKernel
 #endif
 
 #if CK_TILE_FMHA_FORCE_HEAD_MAJOR
-        const bool is_bhsd_layout = (kargs.stride_q == kargs.hdim_q);
+        // bhsd should satisfy stride_q == hdim_q and nhead_stride_q > hdim_q.
+        // The extra nhead_stride_q guard prevents bshd false-positive when nhead == 1.
+        const bool is_bhsd_layout =
+            (kargs.stride_q == kargs.hdim_q) && (kargs.nhead_stride_q > kargs.hdim_q);
         if(is_bhsd_layout)
         {
             const index_t num_tile_n1 =
@@ -1613,8 +1644,9 @@ struct FmhaFwdKernel
             auto dropout = [&, i_nhead_ = i_nhead, i_batch_ = i_batch]() {
                 if constexpr(kHasDropout)
                 {
-                    const auto num_head_q_total = kargs.num_head_q;
-                    const auto i_head_global    = i_nhead_;
+                    const auto num_head_q_total =
+                        (kargs.num_head_q_total > 0 ? kargs.num_head_q_total : kargs.num_head_q);
+                    const auto i_head_global = kargs.head_start + i_nhead_;
                     return BlockDropout{i_batch_,
                                         i_head_global,
                                         num_head_q_total,
