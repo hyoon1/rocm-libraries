@@ -38,6 +38,7 @@ fi
 # iperm/operm=1 => bhsd (head-major); 0 => bshd (seq-major)
 IPERM_FLAG="-iperm=${IPERM:-1}"
 OPERM_FLAG="-operm=${OPERM:-1}"
+INIT_FLAG="-init=${INIT:-uf}"
 
 echo "Executable=${BIN}"
 echo "Mode=${MODE}"
@@ -46,8 +47,9 @@ echo "Config: B1 H24 d128 bf16 noncausal"
 echo "LSE flag: ${LSE_FLAG}"
 echo "Kernel name: ${KNAME_FLAG}"
 echo "Input permute: ${IPERM_FLAG}  Output permute: ${OPERM_FLAG}"
-WARMUP=3
-REPEAT=5
+echo "Init: ${INIT_FLAG}"
+WARMUP="${WARMUP:-3}"
+REPEAT="${REPEAT:-5}"
 echo "Warmup=${WARMUP} Repeat=${REPEAT}"
 
 run_mode() {
@@ -57,13 +59,17 @@ run_mode() {
     echo "Running ${label} L=${L} ..."
     if [ "$label" = "group" ]; then
       ${BIN} -prec=bf16 ${mode_flag} -b=1 -h=24 -d=128 -s=${L} -s_k=${L} \
-        -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG}
+        -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} ${INIT_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG}
     else
       ${BIN} -prec=bf16 ${mode_flag} -b=1 -h=24 -d=128 -s=${L} \
-        -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG}
+        -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} ${INIT_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG}
     fi
   done
 }
 
-[ "$RUN_DENSE" -eq 1 ] && run_mode "-mode=0" "dense"
-[ "$RUN_GROUP" -eq 1 ] && run_mode "-mode=1" "group"
+if [ "$RUN_DENSE" -eq 1 ]; then
+  run_mode "-mode=0" "dense"
+fi
+if [ "$RUN_GROUP" -eq 1 ]; then
+  run_mode "-mode=1" "group"
+fi
