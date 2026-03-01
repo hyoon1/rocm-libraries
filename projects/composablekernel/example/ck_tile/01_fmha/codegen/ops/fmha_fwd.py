@@ -1103,7 +1103,6 @@ class KernelComponentFactoryGfx950(
 class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
     arch = ArchTrait(
         "gfx11",
-        # Treat gfx115x as gfx11 for codegen/dispatch policy.
         preprocessor_check="defined(__gfx11__)",
     )
 
@@ -1181,6 +1180,27 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
                 pipelines.append(FmhaFwdPipeline("qr", "row", "f", "f", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr", "row", "t", "f", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr", "row", "t", "t", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
+        return pipelines
+
+
+class KernelComponentFactoryGfx115(KernelComponentFactoryGfx11):
+    arch = ArchTrait(
+        "gfx115",
+        preprocessor_check="defined(__gfx1150__) || defined(__gfx1151__)",
+    )
+
+    @classmethod
+    def get_pipelines(
+        cls, dtype, hdim, hdim_v, receipt, mask_impl
+    ) -> List[FmhaFwdPipeline]:
+        pipelines = super().get_pipelines(dtype, hdim, hdim_v, receipt, mask_impl)
+        if dtype in cls._DT_FP16_BF16 and (hdim, hdim_v) == (128, 128):
+            # gfx115x: for long seqlens, skpad=true variants can be faster even when seqlen_k is
+            # divisible by bn0. Gate skpad=false to let dispatch prefer _pssk.
+            long_seqlen_gate = CppConstraint("a.max_seqlen_q < 8192")
+            for pipeline in pipelines:
+                if pipeline.tag in ("qr", "qs") and pipeline.F_skpad == "f":
+                    pipeline.F_constraint = pipeline.F_constraint & long_seqlen_gate
         return pipelines
 
 
@@ -1273,6 +1293,8 @@ def get_factory(target: str):
     if target.startswith("gfx9"):
         return KernelComponentFactoryGfx9
 
+    if target.startswith("gfx115"):
+        return KernelComponentFactoryGfx115
     if target.startswith("gfx11"):
         return KernelComponentFactoryGfx11
     if target.startswith("gfx12"):
