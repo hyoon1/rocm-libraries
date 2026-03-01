@@ -260,6 +260,7 @@ inline std::optional<ck_tile::index_t> get_head_group_size(ck_tile::index_t nhea
         return std::nullopt;
     if(seqlen_k <= 0 || hdim_q <= 0 || hdim_v <= 0 || batch <= 0)
         return std::nullopt;
+    static_cast<void>(batch); // Triton heuristic does not use batch in the trigger condition
 
     const size_t kv_bytes_per_head =
         static_cast<size_t>(seqlen_k) *
@@ -267,20 +268,29 @@ inline std::optional<ck_tile::index_t> get_head_group_size(ck_tile::index_t nhea
     if(kv_bytes_per_head == 0)
         return std::nullopt;
 
-    constexpr long double kLlcUtilization = 0.8L;
+    // Match Triton LLC-aware policy:
+    // - llc_utilization = 1.0
+    // - threshold_ratio = 1.5
+    // - min_group_size  = nheads // 16
+    constexpr long double kLlcUtilization = 1.0L;
     const size_t target_llc_bytes =
         static_cast<size_t>(static_cast<long double>(llc_bytes) * kLlcUtilization);
     if(target_llc_bytes == 0)
         return std::nullopt;
 
-    const size_t total_kv_bytes =
-        static_cast<size_t>(batch) * static_cast<size_t>(nhead_k) * kv_bytes_per_head;
-    if(total_kv_bytes <= target_llc_bytes)
+    const size_t total_kv_bytes = static_cast<size_t>(nhead_q) * kv_bytes_per_head;
+    constexpr long double kThresholdRatio = 1.5L;
+    if(static_cast<long double>(total_kv_bytes) <
+       static_cast<long double>(target_llc_bytes) * kThresholdRatio)
         return std::nullopt;
 
     ck_tile::index_t group = static_cast<ck_tile::index_t>(target_llc_bytes / kv_bytes_per_head);
     if(group < 1)
         group = 1;
+
+    const ck_tile::index_t min_group_size = std::max<ck_tile::index_t>(1, nhead_q / 16);
+    if(group < min_group_size)
+        group = min_group_size;
 
     const ck_tile::index_t gqa_ratio = nhead_q / nhead_k;
     if(gqa_ratio > 1)
