@@ -171,6 +171,12 @@ list(APPEND FMHA_BWD_PRIVATE_COMPILE_OPTIONS -Wno-undefined-func-template)
 list(APPEND FMHA_FWD_PRIVATE_COMPILE_OPTIONS -Wno-float-equal)
 list(APPEND FMHA_BWD_PRIVATE_COMPILE_OPTIONS -Wno-float-equal)
 
+# Emit .s and resource-usage remarks for kernel analysis
+list(APPEND FMHA_FWD_PRIVATE_COMPILE_OPTIONS --save-temps -Rpass-analysis=kernel-resource-usage)
+# --save-temps emits GNU-style line markers in intermediates; suppress under -Weverything -Werror.
+list(APPEND FMHA_FWD_PRIVATE_COMPILE_OPTIONS -Wno-gnu-line-marker)
+list(APPEND FMHA_BWD_PRIVATE_COMPILE_OPTIONS -Wno-gnu-line-marker)
+
 # NOTE: this is dangerous since will change the whole kernel to flush denormals
 #       WIP with compiler team for an exp2 intrinsic..., then remove this
 if(NOT DEFINED FMHA_FWD_FAST_EXP2)
