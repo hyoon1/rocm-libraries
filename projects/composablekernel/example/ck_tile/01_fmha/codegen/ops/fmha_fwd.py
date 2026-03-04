@@ -1148,7 +1148,7 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
                 ( 32,  32) : [FmhaFwdTileSize( 64,  64,  16,  32,  32,   32,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
                 ( 64,  64) : [FmhaFwdTileSize( 64,  64,  32,  64,  32,   64,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1, CppConstraint("a.max_seqlen_q < 4096")),
                               FmhaFwdTileSize(128,  64,  32,  64,  32,   64,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
-                (128, 128) : [# FmhaFwdTileSize( 64,  64,  32, 128,  32,  128,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1, CppConstraint("a.max_seqlen_q < 4096")),
+                (128, 128) : [FmhaFwdTileSize( 64,  64,  32, 128,  32,  128,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1, CppConstraint("a.max_seqlen_q < 4096")),
                               FmhaFwdTileSize(128,  64,  32, 128,  32,  128,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   6)],
                 (192, 128) : [FmhaFwdTileSize( 64,  64,  32, 128,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
                 (256, 256) : [FmhaFwdTileSize(128,  64,  32, 256,  32,  256,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   6)]
@@ -1172,7 +1172,7 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
                 ["t", "f"],
                 ["t", "f"],
             ):
-                pipelines.append(FmhaFwdPipeline("qr", "row", "f", "f", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
+                # pipelines.append(FmhaFwdPipeline("qr", "row", "f", "f", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr", "row", "t", "t", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr", "row", "t", "t", "t", "t", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
         return pipelines
