@@ -15,6 +15,25 @@ else
 fi
 
 BIN="./build/bin/tile_example_fmha_fwd"
+
+# Problem config (can be overridden via env vars).
+# Examples:
+#   HDIM=64 ./measure_ck_tile_fmha_tflops.sh
+#   HDIM=128 NHEAD_Q=16 NHEAD_K=16 DTYPE=fp16 BATCH=2 ./measure_ck_tile_fmha_tflops.sh dense
+DTYPE="${DTYPE:-${PREC:-bf16}}"
+BATCH="${BATCH:-1}"
+HDIM="${HDIM:-128}"
+HDIM_V="${HDIM_V:-${HDIM}}"
+if [ -n "${NHEAD_Q:-}" ]; then
+  NHEAD_Q="${NHEAD_Q}"
+else
+  NHEAD_Q=$((2048 / HDIM))
+fi
+NHEAD_K="${NHEAD_K:-${NHEAD_Q}}"
+if [ "${NHEAD_Q}" -le 0 ]; then
+  echo "Invalid NHEAD_Q=${NHEAD_Q} (set NHEAD_Q explicitly when using large HDIM)"
+  exit 1
+fi
 # Which modes to run
 RUN_DENSE=0
 RUN_GROUP=0
@@ -43,7 +62,7 @@ INIT_FLAG="-init=${INIT:-uf}"
 echo "Executable=${BIN}"
 echo "Mode=${MODE}"
 echo "Lengths=${LENS[*]}"
-echo "Config: B1 H24 d128 bf16 noncausal"
+echo "Config: B${BATCH} H${NHEAD_Q}/${NHEAD_K} d${HDIM}/${HDIM_V} ${DTYPE} noncausal"
 echo "LSE flag: ${LSE_FLAG}"
 echo "Kernel name: ${KNAME_FLAG}"
 echo "Input permute: ${IPERM_FLAG}  Output permute: ${OPERM_FLAG}"
@@ -140,10 +159,10 @@ run_mode() {
   for L in "${LENS[@]}"; do
     echo "Running ${label} L=${L} ..."
     if [ "$label" = "group" ]; then
-      run_output="$(${BIN} -prec=bf16 ${mode_flag} -b=1 -h=24 -d=128 -s=${L} -s_k=${L} \
+      run_output="$(${BIN} -prec=${DTYPE} ${mode_flag} -b=${BATCH} -h=${NHEAD_Q} -h_k=${NHEAD_K} -d=${HDIM} -d_v=${HDIM_V} -s=${L} -s_k=${L} \
         -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} ${INIT_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG})"
     else
-      run_output="$(${BIN} -prec=bf16 ${mode_flag} -b=1 -h=24 -d=128 -s=${L} \
+      run_output="$(${BIN} -prec=${DTYPE} ${mode_flag} -b=${BATCH} -h=${NHEAD_Q} -h_k=${NHEAD_K} -d=${HDIM} -d_v=${HDIM_V} -s=${L} \
         -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} ${INIT_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG})"
     fi
     echo "${run_output}"

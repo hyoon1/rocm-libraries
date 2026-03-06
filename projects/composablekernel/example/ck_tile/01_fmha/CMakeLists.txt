@@ -20,7 +20,7 @@ set(FMHA_FWD_OPTDIM "32,64,80,128,256" CACHE STRING
 set(FMHA_BWD_OPTDIM "32,64,96,128,256" CACHE STRING
   "comma-separated list of hdim values to optimize.")
 set(FMHA_FWD_MINIMAL_FILTER
-  "fmha_fwd_d128_*_*_b*64x32x128x32x128_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*"
+  "fmha_fwd_d*_*_*_b*_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*"
   CACHE STRING "fnmatch filter for FMHA FWD minimal kernel set.")
 if(BUILD_TESTING AND NOT FMHA_FWD_MINIMAL)
   # Build instances of all APIs for tests
@@ -46,7 +46,14 @@ endif()
 if(FMHA_FWD_MINIMAL)
   set(FMHA_FWD_ENABLE_APIS "fwd")
   if(FMHA_FWD_OPTDIM STREQUAL "32,64,80,128,256")
-    set(FMHA_FWD_OPTDIM "128")
+    set(FMHA_FWD_OPTDIM "64,128,256")
+  endif()
+  if(FMHA_FWD_MINIMAL_FILTER STREQUAL
+       "fmha_fwd_d128_*_*_b*64x32x128x32x128_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*"
+     OR FMHA_FWD_MINIMAL_FILTER STREQUAL
+       "fmha_fwd_d*_*_*_b*64x32x128x32x128_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*")
+    set(FMHA_FWD_MINIMAL_FILTER
+        "fmha_fwd_d*_*_*_b*_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*")
   endif()
   set(FMHA_BWD_ENABLE OFF)
 endif()
