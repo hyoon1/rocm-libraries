@@ -116,16 +116,18 @@ print_kernel_resource_usage() {
     return 0
   fi
 
-  vgpr_count="$(awk -F: '/^[[:space:]]*\.vgpr_count:[[:space:]]*/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${asm_file}")"
-  vgpr_spill_count="$(awk -F: '/^[[:space:]]*\.vgpr_spill_count:[[:space:]]*/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${asm_file}")"
-  sgpr_spill_count="$(awk -F: '/^[[:space:]]*\.sgpr_spill_count:[[:space:]]*/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${asm_file}")"
-  scratch_size="$(awk -F: '/^[[:space:]]*\.private_segment_fixed_size:[[:space:]]*/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${asm_file}")"
+  # .s can contain helper kernels (e.g., flush_cache) first. Use the last match,
+  # which corresponds to the actual FMHA kernel in this TU.
+  vgpr_count="$(awk -F: '/^[[:space:]]*\.vgpr_count:[[:space:]]*/ {v=$2} END {if(v != "") {gsub(/[[:space:]]/, "", v); print v}}' "${asm_file}")"
+  vgpr_spill_count="$(awk -F: '/^[[:space:]]*\.vgpr_spill_count:[[:space:]]*/ {v=$2} END {if(v != "") {gsub(/[[:space:]]/, "", v); print v}}' "${asm_file}")"
+  sgpr_spill_count="$(awk -F: '/^[[:space:]]*\.sgpr_spill_count:[[:space:]]*/ {v=$2} END {if(v != "") {gsub(/[[:space:]]/, "", v); print v}}' "${asm_file}")"
+  scratch_size="$(awk -F: '/^[[:space:]]*\.private_segment_fixed_size:[[:space:]]*/ {v=$2} END {if(v != "") {gsub(/[[:space:]]/, "", v); print v}}' "${asm_file}")"
 
   if [ -z "${vgpr_count}" ]; then
-    vgpr_count="$(awk '/\.amdhsa_next_free_vgpr[[:space:]]+[0-9]+/ {print $2; exit}' "${asm_file}")"
+    vgpr_count="$(awk '/\.amdhsa_next_free_vgpr[[:space:]]+[0-9]+/ {v=$2} END {print v}' "${asm_file}")"
   fi
   if [ -z "${scratch_size}" ]; then
-    scratch_size="$(awk '/\.amdhsa_private_segment_fixed_size[[:space:]]+[0-9]+/ {print $2; exit}' "${asm_file}")"
+    scratch_size="$(awk '/\.amdhsa_private_segment_fixed_size[[:space:]]+[0-9]+/ {v=$2} END {print v}' "${asm_file}")"
   fi
 
   echo "  [kernel-metrics] kernel=${kernel} vgpr=${vgpr_count:-N/A} vgpr_spill=${vgpr_spill_count:-N/A} sgpr_spill=${sgpr_spill_count:-N/A} scratch=${scratch_size:-N/A} asm=${asm_file}"
