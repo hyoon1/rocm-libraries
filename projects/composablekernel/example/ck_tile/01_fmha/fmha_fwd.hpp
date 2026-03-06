@@ -10,13 +10,13 @@
 #include "ck_tile/ops/fmha.hpp"
 
 #include "bias.hpp"
+#include "fmha_fwd_head_grouping.hpp"
 #include "mask.hpp"
 #include "quant.hpp"
 #include "rotary.hpp"
-#include "fmha_fwd_head_grouping.hpp"
 
-#include <type_traits>
 #include <iostream>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -651,14 +651,15 @@ CK_TILE_HOST ck_tile::index_t fmha_fwd_resolve_head_group_size_q(const fmha_fwd_
         seqlen_k_for_policy = ck_tile::integer_divide_ceil(args.seqlen_k, args.batch);
     }
 
-    const auto group_size_opt = fmha_fwd_head_grouping::get_head_group_size(args.nhead_q,
-                                                                             args.nhead_k,
-                                                                             args.batch,
-                                                                             seqlen_k_for_policy,
-                                                                             args.hdim_q,
-                                                                             args.hdim_v,
-                                                                             sizeof(typename FmhaKernel::KDataType),
-                                                                             sizeof(typename FmhaKernel::VDataType));
+    const auto group_size_opt =
+        fmha_fwd_head_grouping::get_head_group_size(args.nhead_q,
+                                                    args.nhead_k,
+                                                    args.batch,
+                                                    seqlen_k_for_policy,
+                                                    args.hdim_q,
+                                                    args.hdim_v,
+                                                    sizeof(typename FmhaKernel::KDataType),
+                                                    sizeof(typename FmhaKernel::VDataType));
     if(!group_size_opt.has_value())
         return 0;
 
@@ -668,17 +669,15 @@ CK_TILE_HOST ck_tile::index_t fmha_fwd_resolve_head_group_size_q(const fmha_fwd_
 
     if(fmha_fwd_head_grouping::log_enabled())
     {
-        const std::string arch = ck_tile::get_device_name();
-        const size_t llc_bytes = fmha_fwd_head_grouping::get_llc_cache_bytes(arch);
+        const std::string arch           = ck_tile::get_device_name();
+        const size_t llc_bytes           = fmha_fwd_head_grouping::get_llc_cache_bytes(arch);
         const ck_tile::index_t gqa_ratio = (args.nhead_k > 0 ? (args.nhead_q / args.nhead_k) : 1);
-        const ck_tile::index_t n_groups =
-            ck_tile::integer_divide_ceil(args.nhead_q, group_size);
+        const ck_tile::index_t n_groups  = ck_tile::integer_divide_ceil(args.nhead_q, group_size);
         std::cout << "[LLC Head Grouping] enabled (fmha_fwd auto)"
                   << " arch=" << (arch.empty() ? "unknown" : arch)
-                  << " llc_mb=" << (llc_bytes / (1024ull * 1024ull))
-                  << " nhead_q=" << args.nhead_q << " nhead_k=" << args.nhead_k
-                  << " gqa_ratio=" << gqa_ratio << " group_size=" << group_size
-                  << " groups=" << n_groups << std::endl;
+                  << " llc_mb=" << (llc_bytes / (1024ull * 1024ull)) << " nhead_q=" << args.nhead_q
+                  << " nhead_k=" << args.nhead_k << " gqa_ratio=" << gqa_ratio
+                  << " group_size=" << group_size << " groups=" << n_groups << std::endl;
     }
 
     return group_size;
@@ -691,10 +690,8 @@ template <typename FmhaKernel>
 auto fmha_fwd_create_kargs_and_grids(fmha_fwd_args args)
 {
     assert(args.nhead_q % args.nhead_k == 0);
-    const ck_tile::index_t head_group_size_q =
-        fmha_fwd_resolve_head_group_size_q<FmhaKernel>(args);
-
-    auto kargs = [&] {
+    const ck_tile::index_t head_group_size_q = fmha_fwd_resolve_head_group_size_q<FmhaKernel>(args);
+    auto kargs                               = [&] {
         // create group mode kernel arguments
         if constexpr(FmhaKernel::kIsGroupMode)
         {

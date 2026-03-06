@@ -383,9 +383,9 @@ struct FmhaFwdKernel
                       drop_seed_offset,
                   ck_tile::index_t block_scale_size_q,
                   ck_tile::index_t block_scale_size_kv,
-                  const void* cu_seqlen_q_ptr       = nullptr,
-                  const void* cu_seqlen_k_ptr       = nullptr,
-                  const void* sink_ptr              = nullptr,
+                  const void* cu_seqlen_q_ptr        = nullptr,
+                  const void* cu_seqlen_k_ptr        = nullptr,
+                  const void* sink_ptr               = nullptr,
                   ck_tile::index_t head_group_size_q = 0)
     {
         Kargs kargs{{q_ptr,
@@ -559,9 +559,9 @@ struct FmhaFwdKernel
               const std::tuple<uint64_t, uint64_t>& drop_seed_offset,
               ck_tile::index_t block_scale_size_q,
               ck_tile::index_t block_scale_size_kv,
-              const void* cu_seqlen_q_ptr       = nullptr,
-              const void* cu_seqlen_k_ptr       = nullptr,
-              const void* sink_ptr              = nullptr,
+              const void* cu_seqlen_q_ptr        = nullptr,
+              const void* cu_seqlen_k_ptr        = nullptr,
+              const void* sink_ptr               = nullptr,
               ck_tile::index_t head_group_size_q = 0)
     {
         return MakeKargsImpl(
@@ -618,7 +618,10 @@ struct FmhaFwdKernel
             std::make_pair(std::get<0>(drop_seed_offset), std::get<1>(drop_seed_offset)),
             block_scale_size_q,
             block_scale_size_kv,
-            cu_seqlen_q_ptr, cu_seqlen_k_ptr, sink_ptr, head_group_size_q);
+            cu_seqlen_q_ptr,
+            cu_seqlen_k_ptr,
+            sink_ptr,
+            head_group_size_q);
     }
 
     // std::variant<> can't take in a list initializer, overload for backward compatibility
@@ -677,9 +680,9 @@ struct FmhaFwdKernel
               const std::tuple<const void*, const void*>& drop_seed_offset,
               ck_tile::index_t block_scale_size_q,
               ck_tile::index_t block_scale_size_kv,
-              const void* cu_seqlen_q_ptr       = nullptr,
-              const void* cu_seqlen_k_ptr       = nullptr,
-              const void* sink_ptr              = nullptr,
+              const void* cu_seqlen_q_ptr        = nullptr,
+              const void* cu_seqlen_k_ptr        = nullptr,
+              const void* sink_ptr               = nullptr,
               ck_tile::index_t head_group_size_q = 0)
     {
         return MakeKargsImpl(
@@ -736,7 +739,10 @@ struct FmhaFwdKernel
             std::make_pair(std::get<0>(drop_seed_offset), std::get<1>(drop_seed_offset)),
             block_scale_size_q,
             block_scale_size_kv,
-            cu_seqlen_q_ptr, cu_seqlen_k_ptr, sink_ptr, head_group_size_q);
+            cu_seqlen_q_ptr,
+            cu_seqlen_k_ptr,
+            sink_ptr,
+            head_group_size_q);
     }
 
     template <bool Cond = kIsGroupMode>
@@ -790,9 +796,9 @@ struct FmhaFwdKernel
                       drop_seed_offset,
                   ck_tile::index_t block_scale_size_q,
                   ck_tile::index_t block_scale_size_kv,
-                  const void* cu_seqlen_q_ptr       = nullptr,
-                  const void* cu_seqlen_k_ptr       = nullptr,
-                  const void* sink_ptr              = nullptr,
+                  const void* cu_seqlen_q_ptr        = nullptr,
+                  const void* cu_seqlen_k_ptr        = nullptr,
+                  const void* sink_ptr               = nullptr,
                   ck_tile::index_t head_group_size_q = 0)
     {
         Kargs kargs{{q_ptr,
@@ -964,9 +970,9 @@ struct FmhaFwdKernel
               const std::tuple<uint64_t, uint64_t>& drop_seed_offset,
               ck_tile::index_t block_scale_size_q,
               ck_tile::index_t block_scale_size_kv,
-              const void* cu_seqlen_q_ptr       = nullptr,
-              const void* cu_seqlen_k_ptr       = nullptr,
-              const void* sink_ptr              = nullptr,
+              const void* cu_seqlen_q_ptr        = nullptr,
+              const void* cu_seqlen_k_ptr        = nullptr,
+              const void* sink_ptr               = nullptr,
               ck_tile::index_t head_group_size_q = 0)
     {
         return MakeKargsImpl(
@@ -1018,7 +1024,10 @@ struct FmhaFwdKernel
             std::make_pair(std::get<0>(drop_seed_offset), std::get<1>(drop_seed_offset)),
             block_scale_size_q,
             block_scale_size_kv,
-            cu_seqlen_q_ptr, cu_seqlen_k_ptr, sink_ptr, head_group_size_q);
+            cu_seqlen_q_ptr,
+            cu_seqlen_k_ptr,
+            sink_ptr,
+            head_group_size_q);
     }
 
     // std::variant<> can't take in a list initializer, overload for backward compatibility
@@ -1072,9 +1081,9 @@ struct FmhaFwdKernel
               const std::tuple<const void*, const void*>& drop_seed_offset,
               ck_tile::index_t block_scale_size_q,
               ck_tile::index_t block_scale_size_kv,
-              const void* cu_seqlen_q_ptr       = nullptr,
-              const void* cu_seqlen_k_ptr       = nullptr,
-              const void* sink_ptr              = nullptr,
+              const void* cu_seqlen_q_ptr        = nullptr,
+              const void* cu_seqlen_k_ptr        = nullptr,
+              const void* sink_ptr               = nullptr,
               ck_tile::index_t head_group_size_q = 0)
     {
         return MakeKargsImpl(
@@ -1126,7 +1135,10 @@ struct FmhaFwdKernel
             std::make_pair(std::get<0>(drop_seed_offset), std::get<1>(drop_seed_offset)),
             block_scale_size_q,
             block_scale_size_kv,
-            cu_seqlen_q_ptr, cu_seqlen_k_ptr, sink_ptr, head_group_size_q);
+            cu_seqlen_q_ptr,
+            cu_seqlen_k_ptr,
+            sink_ptr,
+            head_group_size_q);
     }
 
     CK_TILE_HOST static constexpr auto GridSize(ck_tile::index_t batch_size_,
@@ -1201,7 +1213,7 @@ struct FmhaFwdKernel
                 if((tail_heads > 0) && (linear_id >= full_groups * blocks_per_group))
                 {
                     // Tail group decode: [group=tail] -> [batch] -> [block] -> [head_in_group]
-                    const index_t tail_linear = linear_id - full_groups * blocks_per_group;
+                    const index_t tail_linear      = linear_id - full_groups * blocks_per_group;
                     const index_t tail_group_heads = tail_heads;
                     const index_t tail_blocks_per_batch = num_tile_total * tail_group_heads;
 
@@ -1217,9 +1229,9 @@ struct FmhaFwdKernel
                     // Full group decode: [group] -> [batch] -> [block] -> [head_in_group]
                     i_group = linear_id / blocks_per_group;
 
-                    const index_t rem0 = linear_id - i_group * blocks_per_group;
+                    const index_t rem0             = linear_id - i_group * blocks_per_group;
                     const index_t blocks_per_batch = num_tile_total * group_sz;
-                    i_batch = rem0 / blocks_per_batch;
+                    i_batch                        = rem0 / blocks_per_batch;
 
                     const index_t rem1 = rem0 - i_batch * blocks_per_batch;
                     i_block            = rem1 / group_sz;
