@@ -4,6 +4,7 @@ set -euo pipefail
 # Measure CK tile FMHA example over a set of seqlens for dense and/or group modes.
 # Usage: ./measure_ck_tile_fmha_tflops.sh [dense|group|both] [lengths...]
 # Set LSE=1 to force LSE storage (-lse=1); defaults to -lse=0.
+# Set HDIM=<int> to select head dimension; defaults to 128.
 
 MODE="${1:-dense}" # dense -> mode=0, group -> mode=1, both -> run both
 shift || true
@@ -39,11 +40,12 @@ fi
 IPERM_FLAG="-iperm=${IPERM:-1}"
 OPERM_FLAG="-operm=${OPERM:-1}"
 INIT_FLAG="-init=${INIT:-uf}"
+HDIM_VALUE="${HDIM:-128}"
 
 echo "Executable=${BIN}"
 echo "Mode=${MODE}"
 echo "Lengths=${LENS[*]}"
-echo "Config: B1 H24 d128 bf16 noncausal"
+echo "Config: B1 H24 d${HDIM_VALUE} bf16 noncausal"
 echo "LSE flag: ${LSE_FLAG}"
 echo "Kernel name: ${KNAME_FLAG}"
 echo "Input permute: ${IPERM_FLAG}  Output permute: ${OPERM_FLAG}"
@@ -135,16 +137,27 @@ run_mode() {
   local mode_flag="$1"
   local label="$2"
   local run_output=""
+  local run_rc=0
   for L in "${LENS[@]}"; do
     echo "Running ${label} L=${L} ..."
     if [ "$label" = "group" ]; then
-      run_output="$(${BIN} -prec=bf16 ${mode_flag} -b=1 -h=24 -d=128 -s=${L} -s_k=${L} \
-        -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} ${INIT_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG})"
+      set +e
+      run_output="$(${BIN} -prec=bf16 ${mode_flag} -b=1 -h=24 -d=${HDIM_VALUE} -s=${L} -s_k=${L} \
+        -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} ${INIT_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG} 2>&1)"
+      run_rc=$?
+      set -e
     else
-      run_output="$(${BIN} -prec=bf16 ${mode_flag} -b=1 -h=24 -d=128 -s=${L} \
-        -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} ${INIT_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG})"
+      set +e
+      run_output="$(${BIN} -prec=bf16 ${mode_flag} -b=1 -h=24 -d=${HDIM_VALUE} -s=${L} \
+        -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} ${INIT_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG} 2>&1)"
+      run_rc=$?
+      set -e
     fi
     echo "${run_output}"
+    if [ "${run_rc}" -ne 0 ]; then
+      echo "  [run-status] exit_code=${run_rc} (continuing)"
+      continue
+    fi
     print_kernel_resource_usage "${run_output}"
   done
 }
