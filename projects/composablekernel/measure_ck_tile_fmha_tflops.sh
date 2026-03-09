@@ -101,7 +101,12 @@ print_kernel_resource_usage() {
   local output="$1"
   local kernel=""
   local asm_file=""
+  local kernel_hdim=""
+  local tile_shape=""
+  local pad_mode=""
+  local pipeline=""
   local vgpr_count=""
+  local sgpr_count=""
   local vgpr_spill_count=""
   local sgpr_spill_count=""
   local scratch_size=""
@@ -118,6 +123,24 @@ print_kernel_resource_usage() {
     return 0
   fi
 
+  if [[ "${kernel}" =~ fmha_fwd_d([0-9]+)_ ]]; then
+    kernel_hdim="${BASH_REMATCH[1]}"
+  fi
+  if [[ "${kernel}" =~ _b([0-9]+x[0-9]+x[0-9]+x[0-9]+x[0-9]+x[0-9]+)_ ]]; then
+    tile_shape="${BASH_REMATCH[1]}"
+  fi
+  if [[ "${kernel}" =~ _(qr_async_trload_v3|qr_async_trload|qr_async|qr|qs)_v[rc]_ ]]; then
+    pipeline="${BASH_REMATCH[1]}"
+  fi
+  if [[ "${kernel}" == *_psskddv_* ]]; then
+    pad_mode="psskddv"
+  elif [[ "${kernel}" == *_pssk_* ]]; then
+    pad_mode="pssk"
+  elif [[ "${kernel}" == *_npad_* ]]; then
+    pad_mode="npad"
+  fi
+
+  sgpr_count="$(awk -F: '/^[[:space:]]*\.sgpr_count:[[:space:]]*/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${asm_file}")"
   vgpr_count="$(awk -F: '/^[[:space:]]*\.vgpr_count:[[:space:]]*/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${asm_file}")"
   vgpr_spill_count="$(awk -F: '/^[[:space:]]*\.vgpr_spill_count:[[:space:]]*/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${asm_file}")"
   sgpr_spill_count="$(awk -F: '/^[[:space:]]*\.sgpr_spill_count:[[:space:]]*/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${asm_file}")"
@@ -130,7 +153,10 @@ print_kernel_resource_usage() {
     scratch_size="$(awk '/\.amdhsa_private_segment_fixed_size[[:space:]]+[0-9]+/ {print $2; exit}' "${asm_file}")"
   fi
 
-  echo "  [kernel-metrics] kernel=${kernel} vgpr=${vgpr_count:-N/A} vgpr_spill=${vgpr_spill_count:-N/A} sgpr_spill=${sgpr_spill_count:-N/A} scratch=${scratch_size:-N/A} asm=${asm_file}"
+  echo "  [kernel-metrics] kernel=${kernel} tile=${tile_shape:-N/A} pad=${pad_mode:-N/A} pipeline=${pipeline:-N/A} hdim_req=${HDIM_VALUE} hdim_kernel=${kernel_hdim:-N/A} sgpr=${sgpr_count:-N/A} vgpr=${vgpr_count:-N/A} vgpr_spill=${vgpr_spill_count:-N/A} sgpr_spill=${sgpr_spill_count:-N/A} scratch=${scratch_size:-N/A} asm=${asm_file}"
+  if [ -n "${kernel_hdim}" ] && [ "${kernel_hdim}" != "${HDIM_VALUE}" ]; then
+    echo "  [dispatch-note] requested_hdim=${HDIM_VALUE} uses kernel_hdim=${kernel_hdim} (padding/fallback dispatch)"
+  fi
 }
 
 run_mode() {
