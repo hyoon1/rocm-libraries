@@ -15,6 +15,15 @@
 #include <variant>
 
 #define CK_TILE_FMHA_HANDLE_XOR_LENGTH_FOLD 0
+
+#if !defined(CK_TILE_FMHA_FORCE_HEAD_MAJOR)
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx11__) || defined(__gfx12__))
+#define CK_TILE_FMHA_FORCE_HEAD_MAJOR 1
+#else
+#define CK_TILE_FMHA_FORCE_HEAD_MAJOR 0
+#endif
+#endif
+
 // S[seqlen_q, seqlen_k] = Q[seqlen_q, hdim_q] @ K[seqlen_k, hdim_q]
 // S'[seqlen_q, seqlen_k] = S[seqlen_q, seqlen_k] * Scale[1]
 // S''[seqlen_q, seqlen_k] = S'[seqlen_q, seqlen_k] + Bias[seqlen_q, seqlen_k]
@@ -1186,14 +1195,6 @@ struct FmhaFwdKernel
         if constexpr(kIsGroupMode)
             has_padded_seqlen_k = (kargs.seqlen_k_ptr != nullptr);
 
-#if !defined(CK_TILE_FMHA_FORCE_HEAD_MAJOR)
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx11__) || defined(__gfx12__))
-#define CK_TILE_FMHA_FORCE_HEAD_MAJOR 1
-#else
-#define CK_TILE_FMHA_FORCE_HEAD_MAJOR 0
-#endif
-#endif
-
 #if CK_TILE_FMHA_FORCE_HEAD_MAJOR
         // bhsd should satisfy stride_q == hdim_q and nhead_stride_q > hdim_q.
         // The extra nhead_stride_q guard prevents bshd false-positive when nhead == 1.
@@ -1201,28 +1202,48 @@ struct FmhaFwdKernel
             (kargs.stride_q == kargs.hdim_q) && (kargs.nhead_stride_q > kargs.hdim_q);
         if(is_bhsd_layout)
         {
-            const index_t num_tile_n1 =
-                ck_tile::integer_divide_ceil(kargs.hdim_v, FmhaPipeline::kN1);
-            const index_t num_tile_total   = has_padded_seqlen_k ? gridDim.z : gridDim.y;
-            const index_t num_head         = gridDim.x;
-            const index_t blocks_per_batch = num_head * num_tile_total;
-            const index_t linear_id =
-                blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+            bool bypass_head_major = false;
 
-            const index_t i_batch = linear_id / blocks_per_batch;
-            const index_t rem0    = linear_id - i_batch * blocks_per_batch;
-            const index_t i_nhead = rem0 / num_tile_total;
-            const index_t i_block = rem0 - i_nhead * num_tile_total;
-
-            index_t i_tile_m = i_block / num_tile_n1;
-            index_t i_tile_n = i_block - i_tile_m * num_tile_n1;
-
-            if constexpr(kHasMask)
+#if defined(__gfx12__) && (HIP_VERSION_MAJOR == 7) && (HIP_VERSION_MINOR == 1)
+            // On ROCm 7.1, gfx12 had correctness failures for this config.
+            // In that case, bypass head-major optimization and use the generic path below.
+            if constexpr(kIsGroupMode && kHasMask && !kHasDropout &&
+                         (BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS) &&
+                         std::is_same_v<QDataType, ck_tile::fp16_t> &&
+                         std::is_same_v<KDataType, ck_tile::fp16_t> &&
+                         std::is_same_v<VDataType, ck_tile::fp16_t>)
             {
-                const index_t num_tile_m = num_tile_total / num_tile_n1;
-                i_tile_m                 = num_tile_m - 1 - i_tile_m;
+                bypass_head_major =
+                    !has_padded_seqlen_k && (kargs.hdim_q == 192) &&
+                    ((kargs.hdim_v == 128) || (kargs.hdim_v == 192));
             }
-            return ck_tile::make_tuple(i_tile_m, i_tile_n, i_nhead, i_batch);
+#endif
+
+            if(!bypass_head_major)
+            {
+                const index_t num_tile_n1 =
+                    ck_tile::integer_divide_ceil(kargs.hdim_v, FmhaPipeline::kN1);
+                const index_t num_tile_total   = has_padded_seqlen_k ? gridDim.z : gridDim.y;
+                const index_t num_head         = gridDim.x;
+                const index_t blocks_per_batch = num_head * num_tile_total;
+                const index_t linear_id =
+                    blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+
+                const index_t i_batch = linear_id / blocks_per_batch;
+                const index_t rem0    = linear_id - i_batch * blocks_per_batch;
+                const index_t i_nhead = rem0 / num_tile_total;
+                const index_t i_block = rem0 - i_nhead * num_tile_total;
+
+                index_t i_tile_m = i_block / num_tile_n1;
+                index_t i_tile_n = i_block - i_tile_m * num_tile_n1;
+
+                if constexpr(kHasMask)
+                {
+                    const index_t num_tile_m = num_tile_total / num_tile_n1;
+                    i_tile_m                 = num_tile_m - 1 - i_tile_m;
+                }
+                return ck_tile::make_tuple(i_tile_m, i_tile_n, i_nhead, i_batch);
+            }
         }
 #endif
 
