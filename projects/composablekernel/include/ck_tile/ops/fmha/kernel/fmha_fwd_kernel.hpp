@@ -1196,30 +1196,24 @@ struct FmhaFwdKernel
             has_padded_seqlen_k = (kargs.seqlen_k_ptr != nullptr);
 
 #if CK_TILE_FMHA_FORCE_HEAD_MAJOR
-        // bhsd should satisfy stride_q == hdim_q and nhead_stride_q > hdim_q.
-        // The extra nhead_stride_q guard prevents bshd false-positive when nhead == 1.
-        const bool is_bhsd_layout =
-            (kargs.stride_q == kargs.hdim_q) && (kargs.nhead_stride_q > kargs.hdim_q);
-        if(is_bhsd_layout)
-        {
-            bool bypass_head_major = false;
-
+        // compiler-workaround gate (ROCm 7.1 + gfx12).
+        // Keep head-major enabled for all unaffected kernels.
 #if defined(__gfx12__) && (HIP_VERSION_MAJOR == 7) && (HIP_VERSION_MINOR == 1)
-            // On ROCm 7.1, gfx12 had correctness failures for this config.
-            // In that case, bypass head-major optimization and use the generic path below.
-            if constexpr(kIsGroupMode && kHasMask && !kHasDropout &&
-                         (BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS) &&
-                         std::is_same_v<QDataType, ck_tile::fp16_t> &&
-                         std::is_same_v<KDataType, ck_tile::fp16_t> &&
-                         std::is_same_v<VDataType, ck_tile::fp16_t>)
-            {
-                bypass_head_major =
-                    !has_padded_seqlen_k && (kargs.hdim_q == 192) &&
-                    ((kargs.hdim_v == 128) || (kargs.hdim_v == 192));
-            }
+        constexpr bool kSkipHeadMajor =
+            kIsGroupMode && kHasMask && !kHasDropout &&
+            (BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS) && kPadHeadDimQ && kPadHeadDimV &&
+            (FmhaPipeline::kN1 == 256) && std::is_same_v<QDataType, ck_tile::fp16_t> &&
+            std::is_same_v<KDataType, ck_tile::fp16_t> && std::is_same_v<VDataType, ck_tile::fp16_t>;
+#else
+        constexpr bool kSkipHeadMajor = false;
 #endif
-
-            if(!bypass_head_major)
+        if constexpr(!kSkipHeadMajor)
+        {
+            // bhsd should satisfy stride_q == hdim_q and nhead_stride_q > hdim_q
+            // The extra nhead_stride_q guard prevents bshd false-positive when nhead == 1
+            const bool is_bhsd_layout =
+                (kargs.stride_q == kargs.hdim_q) && (kargs.nhead_stride_q > kargs.hdim_q);
+            if(is_bhsd_layout)
             {
                 const index_t num_tile_n1 =
                     ck_tile::integer_divide_ceil(kargs.hdim_v, FmhaPipeline::kN1);
