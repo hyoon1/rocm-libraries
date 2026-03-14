@@ -134,39 +134,128 @@ struct BlockGemmARegBSmemCRegV2
         constexpr auto a_warp_y_index_zeros = uniform_sequence_gen_t<AWarpDstr::NDimY, 0>{};
         constexpr auto c_warp_y_index_zeros = uniform_sequence_gen_t<CWarpDstr::NDimY, 0>{};
 
-        // hot loop:
-        static_for<0, KIterPerWarp, 1>{}([&](auto kIter) {
-            static_for<0, NIterPerWarp, 1>{}([&](auto nIter) {
-                // read B warp tensor from B Block window
-                const auto b_warp_tensor = load_tile(b_warp_windows(nIter)(kIter));
+        if constexpr(MIterPerWarp == 1 && KIterPerWarp == 2 && NIterPerWarp == 4 &&
+                     BlockGemmShape::kM == 128 && kBlockSize == 256)
+        {
+            static_assert(NIterPerWarp % 2 == 0, "expected even NIterPerWarp for 2-step loop");
 
-                static_for<0, MIterPerWarp, 1>{}([&](auto mIter) {
-                    // read A warp tensor from A block tensor
-                    AWarpTensor a_warp_tensor;
+            // Hot shape: manual 2-step loop to bound liveness and keep true double buffering.
+            // Pair pattern: preload (n0/n1), consume even (k0/k1), refill with n+2, consume odd.
+            // impl::insert_dummy_dep only ties even→odd order; avoids extra movs/renames.
+            auto make_a_warp_tensor = [&](auto kIter) {
+                // A slice per kIter, scoped to pair iteration to limit lifetime.
+                AWarpTensor a_warp_tensor;
+                a_warp_tensor.get_thread_buffer() = a_block_tensor.get_y_sliced_thread_data(
+                    merge_sequences(sequence<number<0>{}, kIter>{}, a_warp_y_index_zeros),
+                    merge_sequences(sequence<1, 1>{}, a_warp_y_lengths));
+                return a_warp_tensor;
+            };
 
-                    a_warp_tensor.get_thread_buffer() = a_block_tensor.get_y_sliced_thread_data(
-                        merge_sequences(sequence<mIter, kIter>{}, a_warp_y_index_zeros),
-                        merge_sequences(sequence<1, 1>{}, a_warp_y_lengths));
+            auto load_c_warp_tensor = [&](auto nIter) {
+                // Load C tile for given nIter; scoped to iteration.
+                CWarpTensor c_warp_tensor;
+                c_warp_tensor.get_thread_buffer() = c_block_tensor.get_y_sliced_thread_data(
+                    merge_sequences(sequence<number<0>{}, nIter>{}, c_warp_y_index_zeros),
+                    merge_sequences(sequence<1, 1>{}, c_warp_y_lengths));
+                return c_warp_tensor;
+            };
 
-                    // read C warp tensor from C block tensor
-                    CWarpTensor c_warp_tensor;
+            auto store_c_warp_tensor = [&](auto nIter, const auto& c_warp_tensor) {
+                // Write back updated C tile.
+                c_block_tensor.set_y_sliced_thread_data(
+                    merge_sequences(sequence<number<0>{}, nIter>{}, c_warp_y_index_zeros),
+                    merge_sequences(sequence<1, 1>{}, c_warp_y_lengths),
+                    c_warp_tensor.get_thread_buffer());
+            };
 
-                    c_warp_tensor.get_thread_buffer() = c_block_tensor.get_y_sliced_thread_data(
-                        merge_sequences(sequence<mIter, nIter>{}, c_warp_y_index_zeros),
-                        merge_sequences(sequence<1, 1>{}, c_warp_y_lengths));
+            // 2-step double buffering across N-iter:
+            // preload n0/n1, then while consuming one slot, refill it with n+2.
+            auto b_even_k0 = load_tile(b_warp_windows(number<0>{})(number<0>{})); // n0 k0
+            auto b_even_k1 = load_tile(b_warp_windows(number<0>{})(number<1>{})); // n0 k1
+            auto b_odd_k0  = load_tile(b_warp_windows(number<1>{})(number<0>{})); // n1 k0
+            auto b_odd_k1  = load_tile(b_warp_windows(number<1>{})(number<1>{})); // n1 k1
 
-                    // warp GEMM
-                    WG{}(c_warp_tensor, a_warp_tensor, b_warp_tensor);
-                    // WG{}(c_warp_tensor, a_warp_tensor, b_warp_tensor_array[nIter]);
+            static_for<0, NIterPerWarp / 2, 1>{}([&](auto pairIter) {
+                constexpr index_t iPair        = pairIter;
+                constexpr index_t iPairNext    = iPair + 1;
+                constexpr bool kHasNextPair    = iPairNext < (NIterPerWarp / 2);
+                constexpr auto n_even          = number<iPair * 2>{};
+                constexpr auto n_odd           = number<iPair * 2 + 1>{};
+                constexpr auto n_even_next     = number<iPairNext * 2>{};
+                constexpr auto n_odd_next      = number<iPairNext * 2 + 1>{};
 
-                    // write C warp tensor into C block tensor
-                    c_block_tensor.set_y_sliced_thread_data(
-                        merge_sequences(sequence<mIter, nIter>{}, c_warp_y_index_zeros),
-                        merge_sequences(sequence<1, 1>{}, c_warp_y_lengths),
-                        c_warp_tensor.get_thread_buffer());
+                // Keep A/C temporaries scoped to this 2-step chunk to help register liveness.
+                const auto a_k0 = make_a_warp_tensor(number<0>{});
+                const auto a_k1 = make_a_warp_tensor(number<1>{});
+
+                auto c_even = load_c_warp_tensor(n_even);
+                // Even n: consume current even buffers, optionally refill for next pair.
+                WG{}(c_even, a_k0, b_even_k0);
+                if constexpr(kHasNextPair)
+                {
+                    b_even_k0 = load_tile(b_warp_windows(n_even_next)(number<0>{}));
+                }
+                WG{}(c_even, a_k1, b_even_k1);
+                if constexpr(kHasNextPair)
+                {
+                    b_even_k1 = load_tile(b_warp_windows(n_even_next)(number<1>{}));
+                }
+
+                auto c_odd = load_c_warp_tensor(n_odd);
+                // Keep a lightweight dependency edge between even/odd chunks
+                // without introducing extra register remapping in asm.
+                impl::insert_dummy_dep(c_even.get_thread_buffer());
+                store_c_warp_tensor(n_even, c_even);
+                // Odd n: consume odd buffers, optionally refill for next pair.
+                WG{}(c_odd, a_k0, b_odd_k0);
+                if constexpr(kHasNextPair)
+                {
+                    b_odd_k0 = load_tile(b_warp_windows(n_odd_next)(number<0>{}));
+                }
+                WG{}(c_odd, a_k1, b_odd_k1);
+                if constexpr(kHasNextPair)
+                {
+                    b_odd_k1 = load_tile(b_warp_windows(n_odd_next)(number<1>{}));
+                }
+                impl::insert_dummy_dep(c_odd.get_thread_buffer());
+                store_c_warp_tensor(n_odd, c_odd);
+            });
+        }
+        else
+        {
+            // hot loop:
+            static_for<0, KIterPerWarp, 1>{}([&](auto kIter) {
+                static_for<0, NIterPerWarp, 1>{}([&](auto nIter) {
+                    // read B warp tensor from B Block window
+                    const auto b_warp_tensor = load_tile(b_warp_windows(nIter)(kIter));
+
+                    static_for<0, MIterPerWarp, 1>{}([&](auto mIter) {
+                        // read A warp tensor from A block tensor
+                        AWarpTensor a_warp_tensor;
+
+                        a_warp_tensor.get_thread_buffer() = a_block_tensor.get_y_sliced_thread_data(
+                            merge_sequences(sequence<mIter, kIter>{}, a_warp_y_index_zeros),
+                            merge_sequences(sequence<1, 1>{}, a_warp_y_lengths));
+
+                        // read C warp tensor from C block tensor
+                        CWarpTensor c_warp_tensor;
+
+                        c_warp_tensor.get_thread_buffer() = c_block_tensor.get_y_sliced_thread_data(
+                            merge_sequences(sequence<mIter, nIter>{}, c_warp_y_index_zeros),
+                            merge_sequences(sequence<1, 1>{}, c_warp_y_lengths));
+
+                        // warp GEMM
+                        WG{}(c_warp_tensor, a_warp_tensor, b_warp_tensor);
+
+                        // write C warp tensor into C block tensor
+                        c_block_tensor.set_y_sliced_thread_data(
+                            merge_sequences(sequence<mIter, nIter>{}, c_warp_y_index_zeros),
+                            merge_sequences(sequence<1, 1>{}, c_warp_y_lengths),
+                            c_warp_tensor.get_thread_buffer());
+                    });
                 });
             });
-        });
+        }
     }
 
     template <index_t MPerBlock = BlockGemmShape::kM, index_t KPerBlock = BlockGemmShape::kK>
