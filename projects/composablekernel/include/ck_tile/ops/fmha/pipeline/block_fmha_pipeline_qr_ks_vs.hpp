@@ -353,24 +353,17 @@ struct BlockFmhaPipelineQRKSVS
             {
                 static_assert(NumMfmaInsts % 8 == 0);
                 static_for<0, NumMfmaInsts / 8, 1>{}([&](auto) {
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 4, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
+                    __builtin_amdgcn_sched_group_barrier(DS_READ, 8, 0); // DS read
                     __builtin_amdgcn_sched_group_barrier(MFMA, 2, 0);    // MFMA
+                    __builtin_amdgcn_sched_group_barrier(DS_READ, 4, 0); // DS read
+                    __builtin_amdgcn_sched_group_barrier(MFMA, 2, 0);    // MFMA
+                    __builtin_amdgcn_sched_group_barrier(DS_READ, 4, 0); // DS read
+                    __builtin_amdgcn_sched_group_barrier(MFMA, 4, 0);    // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x020, 1, 0); // VMEM read
+                    __builtin_amdgcn_sched_group_barrier(0x200, 1, 0); // DS write
                 });
             }
         };
-
         static_assert(2 <= k0_loops);
         static_assert(1 <= k1_loops);
         do
@@ -422,7 +415,6 @@ struct BlockFmhaPipelineQRKSVS
                     schedule_gemm0();
                     block_sync_lds();
                     move_tile_window(k_dram_window, {0, kK0});
-
                     store_tile(
                         k_lds_window,
                         tile_elementwise_in(k_element_func, k_block_tile)); // LDS write i + 1
@@ -430,8 +422,7 @@ struct BlockFmhaPipelineQRKSVS
                 });
             }
 
-            const auto v_prefetch = load_tile(v_dram_window); // prefetch load v tile
-            {                                                 // tail
+            {
                 block_sync_lds();
                 gemm_0(s_acc,
                        get_slice_tile(q_tile,
@@ -444,13 +435,15 @@ struct BlockFmhaPipelineQRKSVS
                 store_tile(k_lds_window, tile_elementwise_in(k_element_func, k_block_tile));
                 block_sync_lds();
 
+                // Keep the same scheduling recipe for the final gemm_0 block.
+                schedule_gemm0();
                 gemm_0(s_acc,
                        get_slice_tile(q_tile,
                                       sequence<0, (k0_loops - 1) * kK0>{},
                                       sequence<kM0, k0_loops * kK0>{}),
                        k_lds_window);
-                schedule_gemm0();
             }
+            const auto v_prefetch = load_tile(v_dram_window); // prefetch V after tail GEMM
             // dequant
             auto s_acc_element_func_ = [&s_acc_element_func, k_descale]() {
                 if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::BLOCKSCALE)
