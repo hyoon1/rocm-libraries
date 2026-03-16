@@ -163,53 +163,58 @@ struct BlockGemmARegBSmemCRegV2
             const auto a_k0 = make_a_warp_tensor(number<0>{});
             const auto a_k1 = make_a_warp_tensor(number<1>{});
 
-            // preload n0 / n1
+            // K-major hot-shape schedule with staged B prefetch:
+            //   ds_load x8  -> wmma x2  -> ds_load x4  -> wmma x2  -> ds_load x4  -> wmma x4
+            // while preserving "all k0 first, then all k1" accumulation order.
             auto b_n0_k0 = load_tile(b_warp_windows(number<0>{})(number<0>{}));
-            auto b_n0_k1 = load_tile(b_warp_windows(number<0>{})(number<1>{}));
+            __builtin_amdgcn_sched_barrier(0);
             auto b_n1_k0 = load_tile(b_warp_windows(number<1>{})(number<0>{}));
+            __builtin_amdgcn_sched_barrier(0);
+            auto b_n2_k0 = load_tile(b_warp_windows(number<2>{})(number<0>{}));
+            __builtin_amdgcn_sched_barrier(0);
+            auto b_n3_k0 = load_tile(b_warp_windows(number<3>{})(number<0>{}));
+            __builtin_amdgcn_sched_barrier(0);
+
+            auto c_n0 = load_c_warp_tensor(number<0>{});
+            auto c_n1 = load_c_warp_tensor(number<1>{});
+            auto c_n2 = load_c_warp_tensor(number<2>{});
+            auto c_n3 = load_c_warp_tensor(number<3>{});
+
+            // consume first half of k0 (n0, n1)
+            WG{}(c_n0, a_k0, b_n0_k0);
+            WG{}(c_n1, a_k0, b_n1_k0);
+            impl::insert_dummy_dep(c_n0.get_thread_buffer(), c_n1.get_thread_buffer());
+
+            // prefetch first half of k1 (n0, n1)
+            auto b_n0_k1 = load_tile(b_warp_windows(number<0>{})(number<1>{}));
+            __builtin_amdgcn_sched_barrier(0);
             auto b_n1_k1 = load_tile(b_warp_windows(number<1>{})(number<1>{}));
             __builtin_amdgcn_sched_barrier(0);
 
-            // consume n0 (2x WMMA)
-            auto c_n0 = load_c_warp_tensor(number<0>{});
-            WG{}(c_n0, a_k0, b_n0_k0);
-            WG{}(c_n0, a_k1, b_n0_k1);
-            impl::insert_dummy_dep(c_n0.get_thread_buffer());
-            store_c_warp_tensor(number<0>{}, c_n0);
-            __builtin_amdgcn_sched_barrier(0);
+            // consume second half of k0 (n2, n3)
+            WG{}(c_n2, a_k0, b_n2_k0);
+            WG{}(c_n3, a_k0, b_n3_k0);
+            impl::insert_dummy_dep(c_n2.get_thread_buffer(), c_n3.get_thread_buffer());
 
-            // preload n2 (4x DS_READ)
-            auto b_n2_k0 = load_tile(b_warp_windows(number<2>{})(number<0>{}));
+            // prefetch second half of k1 (n2, n3)
             auto b_n2_k1 = load_tile(b_warp_windows(number<2>{})(number<1>{}));
             __builtin_amdgcn_sched_barrier(0);
-
-            // consume n1 (2x WMMA)
-            auto c_n1 = load_c_warp_tensor(number<1>{});
-            WG{}(c_n1, a_k0, b_n1_k0);
-            WG{}(c_n1, a_k1, b_n1_k1);
-            impl::insert_dummy_dep(c_n1.get_thread_buffer());
-            store_c_warp_tensor(number<1>{}, c_n1);
-            __builtin_amdgcn_sched_barrier(0);
-
-            // preload n3 (4x DS_READ)
-            auto b_n3_k0 = load_tile(b_warp_windows(number<3>{})(number<0>{}));
             auto b_n3_k1 = load_tile(b_warp_windows(number<3>{})(number<1>{}));
             __builtin_amdgcn_sched_barrier(0);
 
-            // consume n2 / n3 (4x WMMA)
-            impl::insert_dummy_dep(c_n1.get_thread_buffer(),
-                                   b_n2_k0.get_thread_buffer(),
-                                   b_n2_k1.get_thread_buffer());
-            auto c_n2 = load_c_warp_tensor(number<2>{});
-            WG{}(c_n2, a_k0, b_n2_k0);
+            // consume all k1
+            WG{}(c_n0, a_k1, b_n0_k1);
+            WG{}(c_n1, a_k1, b_n1_k1);
             WG{}(c_n2, a_k1, b_n2_k1);
-            impl::insert_dummy_dep(c_n2.get_thread_buffer());
-            store_c_warp_tensor(number<2>{}, c_n2);
-
-            auto c_n3 = load_c_warp_tensor(number<3>{});
-            WG{}(c_n3, a_k0, b_n3_k0);
             WG{}(c_n3, a_k1, b_n3_k1);
-            impl::insert_dummy_dep(c_n3.get_thread_buffer());
+            impl::insert_dummy_dep(c_n0.get_thread_buffer(),
+                                   c_n1.get_thread_buffer(),
+                                   c_n2.get_thread_buffer(),
+                                   c_n3.get_thread_buffer());
+
+            store_c_warp_tensor(number<0>{}, c_n0);
+            store_c_warp_tensor(number<1>{}, c_n1);
+            store_c_warp_tensor(number<2>{}, c_n2);
             store_c_warp_tensor(number<3>{}, c_n3);
         }
         else
