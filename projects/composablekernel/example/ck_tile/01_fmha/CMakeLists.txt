@@ -19,8 +19,14 @@ set(FMHA_FWD_OPTDIM "32,64,80,128,256" CACHE STRING
   "comma-separated list of hdim values to optimize.")
 set(FMHA_BWD_OPTDIM "32,64,96,128,256" CACHE STRING
   "comma-separated list of hdim values to optimize.")
+set(FMHA_FWD_MINIMAL_FILTER_DEFAULT
+  "fmha_fwd_d128_*_*_b*64x32x128x32x128_*_qr_vr_pssk_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale_ntrload_nsink*")
+set(FMHA_FWD_MINIMAL_FILTER_LEGACY_D128
+  "fmha_fwd_d128_*_*_b*64x32x128x32x128_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*")
+set(FMHA_FWD_MINIMAL_FILTER_LEGACY_WIDE
+  "fmha_fwd_d*_*_*_b*64x32*x32x*_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*")
 set(FMHA_FWD_MINIMAL_FILTER
-  "fmha_fwd_d*_*_*_b*64x32*x32x*_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*"
+  "${FMHA_FWD_MINIMAL_FILTER_DEFAULT}"
   CACHE STRING "fnmatch filter for FMHA FWD minimal kernel set.")
 if(BUILD_TESTING AND NOT FMHA_FWD_MINIMAL)
   # Build instances of all APIs for tests
@@ -45,13 +51,17 @@ endif()
 # Minimal build configuration (fwd-only, reduced hdim coverage, minimal filter).
 if(FMHA_FWD_MINIMAL)
   set(FMHA_FWD_ENABLE_APIS "fwd")
-  if(FMHA_FWD_OPTDIM STREQUAL "32,64,80,128,256")
-    set(FMHA_FWD_OPTDIM "64,128,256" CACHE STRING
+  # Keep only kernels needed for:
+  # - measure_ck_tile_fmha_tflops.sh defaults (bf16, dense/group, d=128)
+  # - tile_example_fmha_fwd default config (fp16, batch, d=128)
+  if(FMHA_FWD_OPTDIM STREQUAL "32,64,80,128,256" OR FMHA_FWD_OPTDIM STREQUAL "64,128,256")
+    set(FMHA_FWD_OPTDIM "128" CACHE STRING
       "comma-separated list of hdim values to optimize." FORCE)
   endif()
-  if(FMHA_FWD_MINIMAL_FILTER STREQUAL "fmha_fwd_d128_*_*_b*64x32x128x32x128_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*")
+  if(FMHA_FWD_MINIMAL_FILTER STREQUAL "${FMHA_FWD_MINIMAL_FILTER_LEGACY_D128}" OR
+     FMHA_FWD_MINIMAL_FILTER STREQUAL "${FMHA_FWD_MINIMAL_FILTER_LEGACY_WIDE}")
     set(FMHA_FWD_MINIMAL_FILTER
-      "fmha_fwd_d*_*_*_b*64x32*x32x*_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*"
+      "${FMHA_FWD_MINIMAL_FILTER_DEFAULT}"
       CACHE STRING "fnmatch filter for FMHA FWD minimal kernel set." FORCE)
   endif()
   set(FMHA_BWD_ENABLE OFF)
