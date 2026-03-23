@@ -13,7 +13,22 @@ endif()
 set(FMHA_FWD_KNOWN_APIS "fwd;fwd_splitkv;fwd_appendkv;pagedkv_prefill")
 set(FMHA_FWD_ENABLE_APIS "fwd" CACHE STRING
   "semicolon-separated list of APIs to generate (${FMHA_FWD_KNOWN_APIS}) & link, or \"all\".")
-if(BUILD_TESTING)
+option(FMHA_FWD_MINIMAL "Build only a minimal subset of FMHA FWD kernels" OFF)
+option(FMHA_BWD_ENABLE "Build FMHA BWD kernels and example" ON)
+set(FMHA_FWD_OPTDIM "32,64,80,128,256" CACHE STRING
+  "comma-separated list of hdim values to optimize.")
+set(FMHA_BWD_OPTDIM "32,64,96,128,256" CACHE STRING
+  "comma-separated list of hdim values to optimize.")
+set(FMHA_FWD_MINIMAL_FILTER_DEFAULT
+  "fmha_fwd_d128_*_*_b*64x32x128x32x128_*_qr_vr_pssk_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale_ntrload_nsink*")
+set(FMHA_FWD_MINIMAL_FILTER_LEGACY_D128
+  "fmha_fwd_d128_*_*_b*64x32x128x32x128_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*")
+set(FMHA_FWD_MINIMAL_FILTER_LEGACY_WIDE
+  "fmha_fwd_d*_*_*_b*64x32*x32x*_*_qr_vr_*_nlogits_nbias_nmask_*_ndropout_nskip_nqscale_ntrload_nsink*")
+set(FMHA_FWD_MINIMAL_FILTER
+  "${FMHA_FWD_MINIMAL_FILTER_DEFAULT}"
+  CACHE STRING "fnmatch filter for FMHA FWD minimal kernel set.")
+if(BUILD_TESTING AND NOT FMHA_FWD_MINIMAL)
   # Build instances of all APIs for tests
   message(DEBUG "Enabling all FWD APIs of CK Tile FMHA for because testing is enabled")
   set(FMHA_FWD_ENABLE_APIS "all")
@@ -33,6 +48,25 @@ if(NOT "fwd" IN_LIST FMHA_FWD_ENABLE_APIS)
   list(PREPEND FMHA_FWD_ENABLE_APIS "fwd")
 endif()
 
+# Minimal build configuration (fwd-only, reduced hdim coverage, minimal filter).
+if(FMHA_FWD_MINIMAL)
+  set(FMHA_FWD_ENABLE_APIS "fwd")
+  # Keep only kernels needed for:
+  # - measure_ck_tile_fmha_tflops.sh defaults (bf16, dense/group, d=128)
+  # - tile_example_fmha_fwd default config (fp16, batch, d=128)
+  if(FMHA_FWD_OPTDIM STREQUAL "32,64,80,128,256" OR FMHA_FWD_OPTDIM STREQUAL "64,128,256")
+    set(FMHA_FWD_OPTDIM "128" CACHE STRING
+      "comma-separated list of hdim values to optimize." FORCE)
+  endif()
+  if(FMHA_FWD_MINIMAL_FILTER STREQUAL "${FMHA_FWD_MINIMAL_FILTER_LEGACY_D128}" OR
+     FMHA_FWD_MINIMAL_FILTER STREQUAL "${FMHA_FWD_MINIMAL_FILTER_LEGACY_WIDE}")
+    set(FMHA_FWD_MINIMAL_FILTER
+      "${FMHA_FWD_MINIMAL_FILTER_DEFAULT}"
+      CACHE STRING "fnmatch filter for FMHA FWD minimal kernel set." FORCE)
+  endif()
+  set(FMHA_BWD_ENABLE OFF)
+endif()
+
 file(GLOB_RECURSE CODE_GEN_SCRIPTS CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_LIST_DIR}/generate.py
   ${CMAKE_CURRENT_LIST_DIR}/codegen/*.py
@@ -47,7 +81,7 @@ set(FMHA_FWD_CODE_GEN_COMMON_ARGS
   ${CMAKE_CURRENT_LIST_DIR}/generate.py
   --targets ${FMHA_TARGETS_ARG}
   --api ${FMHA_FWD_APIS}
-  --optdim 32,64,80,128,256
+  --optdim ${FMHA_FWD_OPTDIM}
   # --filter fmha_fwd...
 )
 set(FMHA_BWD_CODE_GEN_COMMON_ARGS
@@ -63,7 +97,11 @@ set(FMHA_BWD_CODE_GEN_COMMON_ARGS
 # TODO: Consider to use a special receipt for testing only, or even two receipts: a small subset of
 # instances for quick CI runs and a larger subset for scheduled runs (the tests skip tests when
 # there is no corresponding instance for parameters).
-if(BUILD_TESTING)
+if(FMHA_FWD_MINIMAL AND NOT FMHA_FWD_MINIMAL_FILTER STREQUAL "")
+  list(APPEND FMHA_FWD_CODE_GEN_COMMON_ARGS --filter ${FMHA_FWD_MINIMAL_FILTER})
+endif()
+
+if(BUILD_TESTING AND NOT FMHA_FWD_MINIMAL)
   # Filters are in the order of FMHA_FWD_KNOWN_APIS: fwd,fwd_splitkv_combine@fwd_splitkv,fwd_appendkv,pagedkv_prefill
   list(APPEND FMHA_FWD_CODE_GEN_COMMON_ARGS --filter *_nlogits*_nskip*_nsink*,*@*_nlogits*_nbias*_nsink*,*,*_nlogits*_nskip*_pagedkv*)
 endif()
@@ -139,6 +177,12 @@ list(APPEND FMHA_BWD_PRIVATE_COMPILE_OPTIONS -Wno-undefined-func-template)
 # Allow comparing floating points directly in order to check sentinel values
 list(APPEND FMHA_FWD_PRIVATE_COMPILE_OPTIONS -Wno-float-equal)
 list(APPEND FMHA_BWD_PRIVATE_COMPILE_OPTIONS -Wno-float-equal)
+
+# Emit .s and resource-usage remarks for kernel analysis
+list(APPEND FMHA_FWD_PRIVATE_COMPILE_OPTIONS --save-temps -Rpass-analysis=kernel-resource-usage)
+# --save-temps emits GNU-style line markers in intermediates; suppress under -Weverything -Werror.
+list(APPEND FMHA_FWD_PRIVATE_COMPILE_OPTIONS -Wno-gnu-line-marker)
+list(APPEND FMHA_BWD_PRIVATE_COMPILE_OPTIONS -Wno-gnu-line-marker)
 
 # NOTE: this is dangerous since will change the whole kernel to flush denormals
 #       WIP with compiler team for an exp2 intrinsic..., then remove this
