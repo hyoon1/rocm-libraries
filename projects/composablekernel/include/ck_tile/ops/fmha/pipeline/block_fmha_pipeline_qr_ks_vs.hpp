@@ -68,6 +68,32 @@ struct BlockFmhaPipelineQRKSVS
     static constexpr uint32_t DS_READ = 0x100; // Barrier for DS (data share) read
     static constexpr uint32_t MFMA    = 0x008; // Barrier for MFMA (matrix multiply-accumulate)
 
+    template <index_t NumMfmaInsts>
+    CK_TILE_DEVICE static constexpr void ScheduleDsReadMfma()
+    {
+        if constexpr(NumMfmaInsts == 1)
+        {
+            __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0);
+            __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);
+        }
+        else if constexpr(NumMfmaInsts == 2)
+        {
+            __builtin_amdgcn_sched_group_barrier(DS_READ, 4, 0);
+            __builtin_amdgcn_sched_group_barrier(MFMA, 2, 0);
+        }
+        else if constexpr(NumMfmaInsts > 2)
+        {
+            __builtin_amdgcn_sched_group_barrier(DS_READ, 4, 0);
+            __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);
+            static_for<0, NumMfmaInsts - 3, 1>{}([&](auto) {
+                __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0);
+                __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);
+            });
+            __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0);
+            __builtin_amdgcn_sched_group_barrier(MFMA, 2, 0);
+        }
+    }
+
     static_assert((CK_TILE_FMHA_FWD_FAST_EXP2 &&
                    (kHasLogitsSoftCap && Problem::BiasEnum == BlockAttentionBiasEnum::NO_BIAS ||
                     !kHasLogitsSoftCap)) ||
@@ -340,7 +366,7 @@ struct BlockFmhaPipelineQRKSVS
         auto schedule_gemm0 = [] {
             using BlockGemm0 = remove_cvref_t<decltype(gemm_0)>;
             constexpr auto WarpGemmConfig =
-                BlockGemm0::Policy::template GetWarpGemmMWarpNWarp<Problem>();
+                BlockGemm0::Policy::template GetWarpGemmMWarpNWarp<typename BlockGemm0::Problem>();
             using WarpGemm0 = remove_cvref_t<decltype(WarpGemmConfig.template at<0>())>;
             constexpr index_t Gemm0MWarp   = WarpGemmConfig.template at<1>();
             constexpr index_t Gemm0NWarp   = WarpGemmConfig.template at<2>();
@@ -351,23 +377,25 @@ struct BlockFmhaPipelineQRKSVS
                                              (kK0 / WarpGemm0K) / (Gemm0MWarp * Gemm0NWarp);
             if constexpr(get_warp_size() == 32 && kQKHeaddim == 128)
             {
-                static_assert(NumMfmaInsts % 8 == 0);
-                static_for<0, NumMfmaInsts / 8, 1>{}([&](auto) {
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 4, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 1, 0);    // MFMA
-                    __builtin_amdgcn_sched_group_barrier(DS_READ, 2, 0); // DS read
-                    __builtin_amdgcn_sched_group_barrier(MFMA, 2, 0);    // MFMA
-                });
+                ScheduleDsReadMfma<NumMfmaInsts>();
+            }
+        };
+
+        auto schedule_gemm1 = [] {
+            using BlockGemm1 = remove_cvref_t<decltype(gemm_1)>;
+            constexpr auto WarpGemmConfig =
+                BlockGemm1::Policy::template GetWarpGemmMWarpNWarp<typename BlockGemm1::Problem>();
+            using WarpGemm1 = remove_cvref_t<decltype(WarpGemmConfig.template at<0>())>;
+            constexpr index_t Gemm1MWarp   = WarpGemmConfig.template at<1>();
+            constexpr index_t Gemm1NWarp   = WarpGemmConfig.template at<2>();
+            constexpr index_t WarpGemm1M   = WarpGemm1::WarpGemmAttribute::Impl::kM;
+            constexpr index_t WarpGemm1N   = WarpGemm1::WarpGemmAttribute::Impl::kN;
+            constexpr index_t WarpGemm1K   = WarpGemm1::WarpGemmAttribute::Impl::kK;
+            constexpr index_t NumMfmaInsts = (kM0 / WarpGemm1M) * (kN1 / WarpGemm1N) *
+                                             (kK1 / WarpGemm1K) / (Gemm1MWarp * Gemm1NWarp);
+            if constexpr(get_warp_size() == 32 && kM0 == 128 && kK1 == 32)
+            {
+                ScheduleDsReadMfma<NumMfmaInsts>();
             }
         };
 
@@ -766,6 +794,7 @@ struct BlockFmhaPipelineQRKSVS
                            get_slice_tile(
                                p, sequence<0, i_k1 * kK1>{}, sequence<kM0, (i_k1 + 1) * kK1>{}),
                            v_lds_window);
+                    schedule_gemm1();
                     block_sync_lds();
                     if constexpr(std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::RowMajor>)
                     {
@@ -800,6 +829,7 @@ struct BlockFmhaPipelineQRKSVS
                 gemm_1(o_acc_,
                        get_slice_tile(p, sequence<0, (k1_loops - 1) * kK1>{}, sequence<kM0, kN0>{}),
                        v_lds_window);
+                schedule_gemm1();
                 block_sync_lds();
             }
             if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::BLOCKSCALE)

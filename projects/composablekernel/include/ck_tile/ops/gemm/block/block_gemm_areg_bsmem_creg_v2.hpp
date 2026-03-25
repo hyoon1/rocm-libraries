@@ -134,13 +134,14 @@ struct BlockGemmARegBSmemCRegV2
         constexpr auto a_warp_y_index_zeros = uniform_sequence_gen_t<AWarpDstr::NDimY, 0>{};
         constexpr auto c_warp_y_index_zeros = uniform_sequence_gen_t<CWarpDstr::NDimY, 0>{};
 
-        if constexpr(MIterPerWarp == 1 && KIterPerWarp == 2 && NIterPerWarp == 4 &&
-                     BlockGemmShape::kM == 128 && kBlockSize == 256)
+        if constexpr(MIterPerWarp == 1 && KIterPerWarp == 2 && NIterPerWarp >= 4 &&
+                     NIterPerWarp % 2 == 0 && BlockGemmShape::kM == 128 && kBlockSize == 256)
         {
             static_assert(NIterPerWarp % 2 == 0, "expected even NIterPerWarp for 2-step loop");
 
-            // Hot shape: manual 2-step loop to bound liveness and keep true double buffering.
-            // Pair pattern: preload (n0/n1), consume even (k0/k1), refill with n+2, consume odd.
+            // Hot even-N shape: manual 2-step loop to bound liveness and keep true double
+            // buffering. Pair pattern: preload (n0/n1), consume even (k0/k1), refill with n+2,
+            // consume odd.
             // impl::insert_dummy_dep only ties even→odd order; avoids extra movs/renames.
             auto make_a_warp_tensor = [&](auto kIter) {
                 // A slice per kIter, scoped to pair iteration to limit lifetime.
