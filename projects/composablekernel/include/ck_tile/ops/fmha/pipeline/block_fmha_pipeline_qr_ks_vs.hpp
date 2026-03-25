@@ -458,8 +458,7 @@ struct BlockFmhaPipelineQRKSVS
                 });
             }
 
-            const auto v_prefetch = load_tile(v_dram_window); // prefetch load v tile
-            {                                                 // tail
+            { // tail
                 block_sync_lds();
                 gemm_0(s_acc,
                        get_slice_tile(q_tile,
@@ -479,6 +478,7 @@ struct BlockFmhaPipelineQRKSVS
                        k_lds_window);
                 schedule_gemm0();
             }
+            const auto v_prefetch = load_tile(v_dram_window); // prefetch load v tile
             // dequant
             auto s_acc_element_func_ = [&s_acc_element_func, k_descale]() {
                 if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::BLOCKSCALE)
