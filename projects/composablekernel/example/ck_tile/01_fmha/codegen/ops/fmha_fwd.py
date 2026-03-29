@@ -306,7 +306,7 @@ class FmhaFwdApiTrait:
                 return "true"  # always support
             else:
                 return "true"
-        elif self.pipeline_tag in ["qr", "qs"]:
+        elif self.pipeline_tag in ["qr", "qr_hdim_vec8", "qs"]:
             if self.spad == "t":
                 return f"true /*a.seqlen_q % {self.bm0} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
             else:
@@ -329,7 +329,7 @@ class FmhaFwdApiTrait:
                 return f"(a.cu_seqlen_k_ptr != nullptr) || (a.seqlen_k == 0 || a.seqlen_k % {self.bn0} != 0)"
             else:
                 return f"(a.cu_seqlen_k_ptr == nullptr) && (a.seqlen_k != 0 && a.seqlen_k % {self.bn0} == 0)"
-        elif self.pipeline_tag in ["qr", "qs"]:
+        elif self.pipeline_tag in ["qr", "qr_hdim_vec8", "qs"]:
             if self.skpad == "t":
                 return f"true /*a.seqlen_k % {self.bn0} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
             else:
@@ -350,6 +350,11 @@ class FmhaFwdApiTrait:
                 return f"a.hdim_q % {vec} == 0"
             else:
                 assert False
+        elif self.pipeline_tag == "qr_hdim_vec8":
+            if self.dpad == "t":
+                return "a.hdim_q % 8 == 0"
+            else:
+                assert False
         elif self.pipeline_tag in ["qr", "qs", "qr_async_trload", "qr_async_trload_v3"]:
             bk0submax = K0_MAX_SUBMAX_MAP[self.bk0max]
             if self.dpad == "t":
@@ -365,6 +370,11 @@ class FmhaFwdApiTrait:
             vec = int((32 * 4) / DTYPE_BITS[self.dtype])
             if self.dvpad == "t":
                 return f"a.hdim_v % {vec} == 0"
+            else:
+                assert False
+        elif self.pipeline_tag == "qr_hdim_vec8":
+            if self.dvpad == "t":
+                return "a.hdim_v % 8 == 0"
             else:
                 assert False
         elif self.pipeline_tag in ["qr", "qs", "qr_async_trload", "qr_async_trload_v3"]:
@@ -1107,6 +1117,35 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
         return cls._DT_FP16_BF16
 
     @classmethod
+    def get_rules(cls) -> List[CompatibilityRule]:
+        rules = super().get_rules()
+
+        def check_d128_tile_pipeline(
+            problem_ctx: ProblemContext, kernel_ctx: KernelContext
+        ) -> bool:
+            if problem_ctx.dtype not in cls._DT_FP16_BF16:
+                return True
+
+            if (problem_ctx.hdim, problem_ctx.hdim_v) != (128, 128):
+                return True
+
+            is_64x32_tile = kernel_ctx.tile.F_bm0 == 64 and kernel_ctx.tile.F_bn0 == 32
+            pads_hdim = (
+                kernel_ctx.pipeline.F_dpad == "t" and kernel_ctx.pipeline.F_dvpad == "t"
+            )
+            exact_hdim = (
+                kernel_ctx.pipeline.F_dpad == "f" and kernel_ctx.pipeline.F_dvpad == "f"
+            )
+
+            if is_64x32_tile:
+                return pads_hdim
+
+            return exact_hdim
+
+        rules.append(check_d128_tile_pipeline)
+        return rules
+
+    @classmethod
     def get_hdim_tile_size_dict(cls, dtype: str) -> Optional[dict]:
         if dtype in cls._DT_FP16_BF16:
             return {
@@ -1114,7 +1153,8 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
                 ( 32,  32) : [FmhaFwdTileSize( 64,  64,  16,  32,  32,   32,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
                 ( 64,  64) : [FmhaFwdTileSize( 64,  64,  32,  64,  32,   64,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1, CppConstraint("a.max_seqlen_q < 4096")),
                               FmhaFwdTileSize(128,  64,  32,  64,  32,   64,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
-                (128, 128) : [FmhaFwdTileSize( 64,  64,  32, 128,  32,  128,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1, CppConstraint("a.max_seqlen_q < 4096")),
+                (128, 128) : [FmhaFwdTileSize( 64,  32,  32, 128,  32,  128,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,   6, CppConstraint("a.hdim_q != 128 || a.hdim_v != 128")),
+                              FmhaFwdTileSize( 64,  64,  32, 128,  32,  128,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1, CppConstraint("a.max_seqlen_q < 4096")),
                               FmhaFwdTileSize(128,  64,  32, 128,  32,  128,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   6)],
                 (192, 128) : [FmhaFwdTileSize( 64,  64,  32, 128,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
                 (256, 256) : [FmhaFwdTileSize(128,  64,  32, 256,  32,  256,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   6)]
@@ -1139,9 +1179,11 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
                 ["t", "f"],
             ):
                 # Keep only ttff/tttt for gfx11: ffff path is often similar or worse
-                #pipelines.append(FmhaFwdPipeline("qr", "row", "f", "f", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
+                # pipelines.append(FmhaFwdPipeline("qr", "row", "f", "f", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr", "row", "t", "t", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
-                pipelines.append(FmhaFwdPipeline("qr", "row", "t", "t", "t", "t", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
+                pipelines.append(FmhaFwdPipeline("qr_hdim_vec8", "row", "t", "t", "t", "t", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
+                if receipt == 1:
+                    pipelines.append(FmhaFwdPipeline("qr", "row", "t", "t", "t", "t", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
         return pipelines
 
 
