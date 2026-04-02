@@ -557,17 +557,15 @@ struct BlockFmhaPipelineQRKSVS
                 });
             }
 
-            auto v_prefetch                        = decltype(load_tile(v_dram_window)){};
-            constexpr bool kUseGfx11SplitVPrefetch = [] {
-#if defined(__gfx11__)
-                return true;
+            auto v_prefetch                   = decltype(load_tile(v_dram_window)){};
+#if defined(__gfx11__) || defined(__gfx12__)
+            constexpr bool kUseSplitVPrefetch = true;
 #else
-                return false;
+            constexpr bool kUseSplitVPrefetch = false;
 #endif
-            }();
-            constexpr bool kPrefetchVBeforeGemm0Tail = !kUseGfx11SplitVPrefetch;
-            constexpr bool kPrefetchVAfterGemm0Tail  = kUseGfx11SplitVPrefetch && !kPadHeadDimV;
-            constexpr bool kPrefetchVAfterSoftmax    = kUseGfx11SplitVPrefetch && kPadHeadDimV;
+            constexpr bool kPrefetchVBeforeGemm0Tail = !kUseSplitVPrefetch;
+            constexpr bool kPrefetchVAfterGemm0Tail  = kUseSplitVPrefetch && !kPadHeadDimV;
+            constexpr bool kPrefetchVAfterSoftmax    = kUseSplitVPrefetch && kPadHeadDimV;
             if constexpr(kPrefetchVBeforeGemm0Tail)
             {
                 load_tile(v_prefetch, v_dram_window); // prefetch load v tile
