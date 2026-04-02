@@ -91,15 +91,8 @@ struct Default2DEpilogue
                                       o_acc_tile.get_tile_distribution()))>;
 
         const auto storeOrUpdateTile = [&](const auto& o_tile) {
-            constexpr bool kUseRawStoreImpl = [] {
-#if defined(__gfx11__)
-                return UseRawStore && kPadM && !kPadN;
-#else
-                return UseRawStore && (kPadM || kPadN);
-#endif
-            }();
             // TODO: this is ugly
-            if constexpr(kUseRawStoreImpl)
+            if constexpr(UseRawStore && (kPadM || kPadN))
             {
                 // FIXME?
                 // if constexpr(decltype(o_dram_window_tmp.get_bottom_tensor_view())::DstInMemOp ==

@@ -92,7 +92,7 @@ struct BlockFmhaPipelineQRKSVS
                                                ? numeric_traits<QDataType>::PackedSize
                                                : Policy::template GetAlignmentQ<Problem>();
     static constexpr index_t kAlignmentK = (kPadHeadDimQ && !kPaddedVecLoadStore)
-	                                       ? numeric_traits<KDataType>::PackedSize
+                                               ? numeric_traits<KDataType>::PackedSize
                                                : Policy::template GetAlignmentK<Problem>();
     static constexpr index_t kAlignmentV = []() {
         if constexpr(std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::RowMajor>)
@@ -557,8 +557,18 @@ struct BlockFmhaPipelineQRKSVS
                 });
             }
 
-            auto v_prefetch = decltype(load_tile(v_dram_window)){};
-            if constexpr(!kPadHeadDimV)
+            auto v_prefetch                        = decltype(load_tile(v_dram_window)){};
+            constexpr bool kUseGfx11SplitVPrefetch = [] {
+#if defined(__gfx11__)
+                return true;
+#else
+                return false;
+#endif
+            }();
+            constexpr bool kPrefetchVBeforeGemm0Tail = !kUseGfx11SplitVPrefetch;
+            constexpr bool kPrefetchVAfterGemm0Tail  = kUseGfx11SplitVPrefetch && !kPadHeadDimV;
+            constexpr bool kPrefetchVAfterSoftmax    = kUseGfx11SplitVPrefetch && kPadHeadDimV;
+            if constexpr(kPrefetchVBeforeGemm0Tail)
             {
                 load_tile(v_prefetch, v_dram_window); // prefetch load v tile
             }
@@ -574,6 +584,10 @@ struct BlockFmhaPipelineQRKSVS
                 block_sync_lds();
 
                 run_gemm_0(number<k0_loops - 1>{});
+            }
+            if constexpr(kPrefetchVAfterGemm0Tail)
+            {
+                load_tile(v_prefetch, v_dram_window);
             }
             // dequant
             auto s_acc_element_func_ = [&s_acc_element_func, k_descale]() {
@@ -832,7 +846,7 @@ struct BlockFmhaPipelineQRKSVS
                     randval_ptr, seq_offset, p_compute, randval_dram_window);
             }
 
-            if constexpr(kPadHeadDimV)
+            if constexpr(kPrefetchVAfterSoftmax)
             {
                 load_tile(v_prefetch, v_dram_window);
             }
@@ -1117,6 +1131,6 @@ struct BlockFmhaPipelineQRKSVS
 };
 
 template <typename Problem_, typename Policy_ = BlockFmhaPipelineQRKSVSDefaultPolicy>
-using BlockFmhaPipelineQRKSVSHdimVec8 = BlockFmhaPipelineQRKSVS<Problem_, Policy_, true>;
+using BlockFmhaPipelineQRKSVSHpad = BlockFmhaPipelineQRKSVS<Problem_, Policy_, true>;
 
 } // namespace ck_tile
