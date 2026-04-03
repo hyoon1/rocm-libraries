@@ -557,7 +557,7 @@ struct BlockFmhaPipelineQRKSVS
                 });
             }
 
-            auto v_prefetch                   = decltype(load_tile(v_dram_window)){};
+            auto v_prefetch = decltype(load_tile(v_dram_window)){};
 #if defined(__gfx11__) || defined(__gfx12__)
             constexpr bool kUseSplitVPrefetch = true;
 #else
