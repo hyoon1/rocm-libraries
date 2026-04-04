@@ -224,9 +224,30 @@ if(CK_USE_OCP_FP8)
   list(APPEND FMHA_FWD_INTERFACE_COMPILE_OPTIONS -DCK_TILE_USE_OCP_FP8)
 endif()
 
-# use RTN_ASM on float to bfloat16 conversion by default, align with FA upstream
-list(APPEND FMHA_BWD_PRIVATE_COMPILE_OPTIONS -DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3)
-list(APPEND FMHA_BWD_INTERFACE_COMPILE_OPTIONS -DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3)
+# For pure gfx11/gfx12 FMHA builds, use Triton RTNE for both FWD and BWD so
+# standalone CK matches the FlashAttention CK backend configuration. For mixed
+# builds, keep the historical BWD-only RTN_ASM override because compile options
+# are target-wide and cannot vary per offload arch within one target.
+set(FMHA_ALL_TARGETS_ARE_GFX11_OR_GFX12 ON)
+foreach(inst_target ${INST_TARGETS})
+  if(NOT inst_target MATCHES "^gfx11|^gfx12")
+    set(FMHA_ALL_TARGETS_ARE_GFX11_OR_GFX12 OFF)
+    break()
+  endif()
+endforeach()
+
+if(FMHA_ALL_TARGETS_ARE_GFX11_OR_GFX12)
+  foreach(opt_list
+      FMHA_FWD_PRIVATE_COMPILE_OPTIONS
+      FMHA_FWD_INTERFACE_COMPILE_OPTIONS
+      FMHA_BWD_PRIVATE_COMPILE_OPTIONS
+      FMHA_BWD_INTERFACE_COMPILE_OPTIONS)
+    list(APPEND ${opt_list} -DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=5)
+  endforeach()
+else()
+  list(APPEND FMHA_BWD_PRIVATE_COMPILE_OPTIONS -DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3)
+  list(APPEND FMHA_BWD_INTERFACE_COMPILE_OPTIONS -DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3)
+endif()
 
 target_compile_options(${FMHA_FWD_INSTANCES}
   PRIVATE ${FMHA_FWD_PRIVATE_COMPILE_OPTIONS}
