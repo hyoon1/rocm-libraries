@@ -23,6 +23,7 @@ enum class bf16_rounding_mode
     truncate,
     standard_asm,
     rta_asm, // round to nearest away
+    triton_rtne,
 };
 
 template <bf16_rounding_mode rounding =
@@ -226,6 +227,36 @@ uint16_t float_to_bf16_rta_asm(float f)
     return u.hi;
 }
 
+// Match Triton's AMD RTNE path: canonicalize NaN instead of preserving payload/sign.
+CK_TILE_HOST
+constexpr uint16_t float_to_bf16_triton_rtn_raw(float f)
+{
+    uint32_t bits = bit_cast<uint32_t>(f);
+    constexpr uint32_t exp_mask  = 0x7f800000;
+    constexpr uint32_t mant_mask = 0x007fffff;
+
+    if((bits & exp_mask) == exp_mask && (bits & mant_mask))
+    {
+        bits = 0x7fff0000;
+    }
+    else
+    {
+        bits += 0x7fff + ((bits >> 16) & 1);
+    }
+
+    return uint16_t(bits >> 16);
+}
+
+CK_TILE_DEVICE
+uint16_t float_to_bf16_triton_rtn_raw(float f)
+{
+    uint32_t bits = bit_cast<uint32_t>(f);
+    uint32_t tmp  = (bits >> 16) & 1;
+    uint32_t res  = __builtin_isnan(f) ? 0x7fff0000 : bits + tmp + 0x7fff;
+
+    return uint16_t(res >> 16);
+}
+
 // Truncate instead of rounding, preserving SNaN
 CK_TILE_HOST_DEVICE
 constexpr uint16_t float_to_bf16_truc_nan_raw(float f)
@@ -249,6 +280,8 @@ CK_TILE_HOST_DEVICE constexpr uint16_t float_to_bf16_raw(float f, constant<round
         return float_to_bf16_rtn_raw(f);
     else if constexpr(rounding == bf16_rounding_mode::standard_asm)
         return float_to_bf16_rtn_asm(f);
+    else if constexpr(rounding == bf16_rounding_mode::triton_rtne)
+        return float_to_bf16_triton_rtn_raw(f);
     else if constexpr(rounding == bf16_rounding_mode::truncate_with_nan)
         return float_to_bf16_truc_nan_raw(f);
     else if constexpr(rounding == bf16_rounding_mode::rta_asm)
