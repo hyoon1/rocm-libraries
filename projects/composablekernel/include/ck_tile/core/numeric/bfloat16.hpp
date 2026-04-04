@@ -228,14 +228,30 @@ uint16_t float_to_bf16_rta_asm(float f)
 }
 
 // Match Triton's AMD RTNE path: canonicalize NaN instead of preserving payload/sign.
-CK_TILE_HOST
-constexpr uint16_t float_to_bf16_triton_rtn_raw(float f)
+CK_TILE_HOST_DEVICE
+constexpr bool float_is_nan_raw(float f)
 {
+#if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
+    // Fast-math assumes NaNs do not occur, so keep the finite fast path.
+    (void)f;
+    return false;
+#elif defined(__has_builtin) && __has_builtin(__builtin_isnan)
+    return __builtin_isnan(f);
+#else
     uint32_t bits = bit_cast<uint32_t>(f);
     constexpr uint32_t exp_mask  = 0x7f800000;
     constexpr uint32_t mant_mask = 0x007fffff;
 
-    if((bits & exp_mask) == exp_mask && (bits & mant_mask))
+    return (bits & exp_mask) == exp_mask && (bits & mant_mask);
+#endif
+}
+
+CK_TILE_HOST
+constexpr uint16_t float_to_bf16_triton_rtn_raw(float f)
+{
+    uint32_t bits = bit_cast<uint32_t>(f);
+
+    if(float_is_nan_raw(f))
     {
         bits = 0x7fff0000;
     }
@@ -252,7 +268,7 @@ uint16_t float_to_bf16_triton_rtn_raw(float f)
 {
     uint32_t bits = bit_cast<uint32_t>(f);
     uint32_t tmp  = (bits >> 16) & 1;
-    uint32_t res  = __builtin_isnan(f) ? 0x7fff0000 : bits + tmp + 0x7fff;
+    uint32_t res  = float_is_nan_raw(f) ? 0x7fff0000 : bits + tmp + 0x7fff;
 
     return uint16_t(res >> 16);
 }
