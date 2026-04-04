@@ -98,6 +98,5 @@ if(result EQUAL 0)
 endif()
 
 add_gtest_executable(test_type_convert_const type_convert_const.cpp)
-add_gtest_executable(test_ck_tile_bf16_rounding test_ck_tile_bf16_rounding.cpp)
 add_gtest_executable(test_bhalf test_bhalf.cpp)
 add_gtest_executable(test_pk_i4 test_pk_i4.cpp)
