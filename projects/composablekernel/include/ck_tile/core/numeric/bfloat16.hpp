@@ -23,7 +23,7 @@ enum class bf16_rounding_mode
     truncate,
     standard_asm,
     rta_asm, // round to nearest away
-    triton_rtne,
+    standard_cnan, // rtn with canonical NaN
 };
 
 template <bf16_rounding_mode rounding =
@@ -227,15 +227,10 @@ uint16_t float_to_bf16_rta_asm(float f)
     return u.hi;
 }
 
-// Match Triton's AMD RTNE path: canonicalize NaN instead of preserving payload/sign.
 CK_TILE_HOST_DEVICE
 constexpr bool float_is_nan_raw(float f)
 {
-#if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
-    // Fast-math assumes NaNs do not occur, so keep the finite fast path.
-    (void)f;
-    return false;
-#elif defined(__has_builtin) && __has_builtin(__builtin_isnan)
+#if defined(__has_builtin) && __has_builtin(__builtin_isnan)
     return __builtin_isnan(f);
 #else
     uint32_t bits = bit_cast<uint32_t>(f);
@@ -246,31 +241,19 @@ constexpr bool float_is_nan_raw(float f)
 #endif
 }
 
-CK_TILE_HOST
-constexpr uint16_t float_to_bf16_triton_rtn_raw(float f)
+CK_TILE_HOST_DEVICE
+constexpr uint16_t float_to_bf16_rtn_cnan_raw(float f)
 {
-    uint32_t bits = bit_cast<uint32_t>(f);
-
-    if(float_is_nan_raw(f))
-    {
-        bits = 0x7fff0000;
-    }
-    else
-    {
-        bits += 0x7fff + ((bits >> 16) & 1);
-    }
-
-    return uint16_t(bits >> 16);
-}
-
-CK_TILE_DEVICE
-uint16_t float_to_bf16_triton_rtn_raw(float f)
-{
+#if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
+    // Fast/finite-math can fold the NaN predicate away, so fall back to standard RTN.
+    return float_to_bf16_rtn_raw(f);
+#else
     uint32_t bits = bit_cast<uint32_t>(f);
     uint32_t tmp  = (bits >> 16) & 1;
     uint32_t res  = float_is_nan_raw(f) ? 0x7fff0000 : bits + tmp + 0x7fff;
 
     return uint16_t(res >> 16);
+#endif
 }
 
 // Truncate instead of rounding, preserving SNaN
@@ -296,8 +279,8 @@ CK_TILE_HOST_DEVICE constexpr uint16_t float_to_bf16_raw(float f, constant<round
         return float_to_bf16_rtn_raw(f);
     else if constexpr(rounding == bf16_rounding_mode::standard_asm)
         return float_to_bf16_rtn_asm(f);
-    else if constexpr(rounding == bf16_rounding_mode::triton_rtne)
-        return float_to_bf16_triton_rtn_raw(f);
+    else if constexpr(rounding == bf16_rounding_mode::standard_cnan)
+        return float_to_bf16_rtn_cnan_raw(f);
     else if constexpr(rounding == bf16_rounding_mode::truncate_with_nan)
         return float_to_bf16_truc_nan_raw(f);
     else if constexpr(rounding == bf16_rounding_mode::rta_asm)
