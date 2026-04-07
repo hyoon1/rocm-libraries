@@ -409,13 +409,13 @@ run_mode() {
     echo "Running ${label} L=${L} ..."
     if [ "$label" = "group" ]; then
       set +e
-      run_output="$(${BIN} -prec=bf16 ${mode_flag} -b=1 -h=16 -d=${HDIM_VALUE} -s=${L} -s_k=${L} \
+      run_output="$(${BIN} -prec=bf16 ${mode_flag} -b=1 -h=24 -d=${HDIM_VALUE} -s=${L} -s_k=${L} \
         -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} ${INIT_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG} 2>&1)"
       run_rc=$?
       set -e
     else
       set +e
-      run_output="$(${BIN} -prec=bf16 ${mode_flag} -b=1 -h=16 -d=${HDIM_VALUE} -s=${L} \
+      run_output="$(${BIN} -prec=bf16 ${mode_flag} -b=1 -h=24 -d=${HDIM_VALUE} -s=${L} \
         -v=0 ${KNAME_FLAG} ${IPERM_FLAG} ${OPERM_FLAG} ${INIT_FLAG} -warmup=${WARMUP} -repeat=${REPEAT} ${LSE_FLAG} 2>&1)"
       run_rc=$?
       set -e
