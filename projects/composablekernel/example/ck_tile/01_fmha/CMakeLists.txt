@@ -136,6 +136,7 @@ add_custom_command(
   --output_dir ${CMAKE_CURRENT_BINARY_DIR}
   DEPENDS ${CODE_GEN_SCRIPTS}
   COMMENT "Generate CK Tile FMHA FWD kernels"
+  VERBATIM
 )
 
 add_custom_command(
@@ -144,6 +145,7 @@ add_custom_command(
   --output_dir ${CMAKE_CURRENT_BINARY_DIR}
   DEPENDS ${CODE_GEN_SCRIPTS}
   COMMENT "Generate CK Tile FMHA BWD kernels"
+  VERBATIM
 )
 
 set(FMHA_FWD_INSTANCES "tile_fmha_fwd_instances")
