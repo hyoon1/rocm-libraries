@@ -22,7 +22,7 @@ enum class bf16_rounding_mode
     truncate_with_nan,
     truncate,
     standard_asm,
-    rta_asm, // round to nearest away
+    rta_asm,       // round to nearest away
     standard_cnan, // rtn with canonical NaN
 };
 
@@ -233,7 +233,7 @@ constexpr bool float_is_nan_raw(float f)
 #if defined(__has_builtin) && __has_builtin(__builtin_isnan)
     return __builtin_isnan(f);
 #else
-    uint32_t bits = bit_cast<uint32_t>(f);
+    uint32_t bits                = bit_cast<uint32_t>(f);
     constexpr uint32_t exp_mask  = 0x7f800000;
     constexpr uint32_t mant_mask = 0x007fffff;
 
