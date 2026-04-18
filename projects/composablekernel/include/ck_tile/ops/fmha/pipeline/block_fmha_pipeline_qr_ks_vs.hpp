@@ -16,7 +16,8 @@ namespace ck_tile {
 // This pipeline is qkv all located in LDS
 template <typename Problem_,
           typename Policy_         = BlockFmhaPipelineQRKSVSDefaultPolicy,
-          bool PaddedVecLoadStore_ = false>
+          bool PaddedVecLoadStore_ = false,
+          bool SplitHeadDim_       = false>
 struct BlockFmhaPipelineQRKSVS
 {
     using Problem               = remove_cvref_t<Problem_>;
@@ -73,7 +74,12 @@ struct BlockFmhaPipelineQRKSVS
     static constexpr auto QScaleEnum          = Problem::QScaleEnum;
     static constexpr bool kHasSink            = Problem::kHasSink;
     static constexpr bool kPaddedVecLoadStore = PaddedVecLoadStore_;
+    static constexpr bool kSplitHeadDim       = SplitHeadDim_;
     static constexpr bool kUseHdimTailArgs    = kPadHeadDimQ || kPadHeadDimV;
+    static constexpr index_t kSplitHeadDimMain = 64;
+    static constexpr index_t kSplitHeadDimTailMax =
+        kSplitHeadDim ? 32
+                      : (kQKHeaddim > kSplitHeadDimMain ? (kQKHeaddim - kSplitHeadDimMain) : 0);
 
     static constexpr ck_tile::index_t kQKScaleGranularity = Problem::kQKScaleGranularity;
     static constexpr ck_tile::index_t kVScaleGranularity  = Problem::kVScaleGranularity;
@@ -91,6 +97,18 @@ struct BlockFmhaPipelineQRKSVS
                   (!CK_TILE_FMHA_FWD_FAST_EXP2 && !kHasLogitsSoftCap));
     static_assert(!kPaddedVecLoadStore || (kPadHeadDimQ && kPadHeadDimV),
                   "padded vector load/store fast path only applies to padded head-dim kernels");
+    static_assert(!kSplitHeadDim || (kPadHeadDimQ && kPadHeadDimV),
+                  "head-dim split path only applies to padded head-dim kernels");
+    static_assert(!kSplitHeadDim || (0 < kSplitHeadDimTailMax),
+                  "head-dim split path requires a non-empty tail");
+    static_assert(!kSplitHeadDim || (kQKHeaddim == 128 && kN1 == 128 && kK0 == 32 && kK1 == 32),
+                  "head-dim split path is only tuned for d128 gfx11/gfx12 kernels");
+    static_assert(
+        !kSplitHeadDim ||
+            std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::RowMajor>,
+        "head-dim split path currently only supports row-major V layout");
+    static_assert(!kSplitHeadDim || QScaleEnum == BlockAttentionQuantScaleEnum::NO_SCALE,
+                  "head-dim split path currently only supports unscaled Q/K/V");
 
     // last dimension vector length used to create tensor view(and decide buffer_load vector length)
     // ... together with tensor distribution. tensor dist should able to overwrite this
@@ -148,7 +166,7 @@ struct BlockFmhaPipelineQRKSVS
         }
     }();
 
-    static constexpr const char* name = "qr";
+    static constexpr const char* name = kSplitHeadDim ? "qr_hsplit" : "qr";
 
     using DropoutType = std::conditional_t<kHasDropout, BlockDropout, NullBlockDropout>;
 
@@ -300,7 +318,49 @@ struct BlockFmhaPipelineQRKSVS
                                               q_dram_block_window_tmp.get_window_origin(),
                                               Policy::template MakeQRegTileDistribution<Problem>());
 
-        auto q = load_tile(q_dram_window);
+        auto q_tile = [&]() {
+            if constexpr(kSplitHeadDim)
+            {
+                return null_tensor{};
+            }
+            else
+            {
+                return tile_elementwise_in(q_element_func, load_tile(q_dram_window));
+            }
+        }();
+
+        auto q_split_head = [&]() {
+            if constexpr(kSplitHeadDim)
+            {
+                auto q_split_head_dram_window = make_tile_window(
+                    q_dram_block_window_tmp.get_bottom_tensor_view(),
+                    make_tuple(number<kM0>{}, number<kSplitHeadDimMain>{}),
+                    q_dram_block_window_tmp.get_window_origin(),
+                    BlockGemm0::template MakeABlockTileDistribution<kM0, kSplitHeadDimMain>());
+                return tile_elementwise_in(q_element_func, load_tile(q_split_head_dram_window));
+            }
+            else
+            {
+                return null_tensor{};
+            }
+        }();
+
+        auto q_split_tail = [&]() {
+            if constexpr(kSplitHeadDim)
+            {
+                auto q_split_tail_dram_window = make_tile_window(
+                    q_dram_block_window_tmp.get_bottom_tensor_view(),
+                    make_tuple(number<kM0>{}, number<kSplitHeadDimTailMax>{}),
+                    q_dram_block_window_tmp.get_window_origin() +
+                        multi_index<2>{0, kSplitHeadDimMain},
+                    BlockGemm0::template MakeABlockTileDistribution<kM0, kSplitHeadDimTailMax>());
+                return tile_elementwise_in(q_element_func, load_tile(q_split_tail_dram_window));
+            }
+            else
+            {
+                return null_tensor{};
+            }
+        }();
 
         using SaccBlockTileType = decltype(gemm_0.MakeCBlockTile());
         auto s_acc              = SaccBlockTileType{};
@@ -316,13 +376,46 @@ struct BlockFmhaPipelineQRKSVS
             SBlockTileType{}, sequence<1>{}, f_max, SMPLComputeDataType{0}));
 
         using OaccBlockTileType = decltype(gemm_1.MakeCBlockTile());
+        using Gemm1SplitHeadProblem = BlockGemmProblem<
+            PDataType,
+            VDataType,
+            OaccDataType,
+            Problem::kNumGemm1Warps * get_warp_size(),
+            TileGemmShape<sequence<kM0, kSplitHeadDimMain, kK1>,
+                          typename BlockFmhaShape::Gemm1BlockWarps,
+                          typename BlockFmhaShape::Gemm1WarpTile>>;
+        using Gemm1SplitTailProblem = BlockGemmProblem<
+            PDataType,
+            VDataType,
+            OaccDataType,
+            Problem::kNumGemm1Warps * get_warp_size(),
+            TileGemmShape<sequence<kM0, kSplitHeadDimTailMax, kK1>,
+                          typename BlockFmhaShape::Gemm1BlockWarps,
+                          typename BlockFmhaShape::Gemm1WarpTile>>;
+        constexpr auto gemm_1_split_head =
+            BlockGemmARegBSmemCRegV2<Gemm1SplitHeadProblem, typename BlockGemm1::Policy>{};
+        constexpr auto gemm_1_split_tail =
+            BlockGemmARegBSmemCRegV2<Gemm1SplitTailProblem, typename BlockGemm1::Policy>{};
+        using OaccSplitHeadBlockTileType = decltype(gemm_1_split_head.MakeCBlockTile());
+        using OaccSplitTailBlockTileType = decltype(gemm_1_split_tail.MakeCBlockTile());
 
         // init Oacc, M, L
-        auto o_acc = OaccBlockTileType{};
+        auto o_acc      = OaccBlockTileType{};
+        auto o_acc_head = OaccSplitHeadBlockTileType{};
+        auto o_acc_tail = OaccSplitTailBlockTileType{};
         auto m     = MLBlockTileType{};
         auto l     = MLBlockTileType{};
 
-        clear_tile(o_acc);
+        if constexpr(kSplitHeadDim)
+        {
+            clear_tile(o_acc_head);
+            clear_tile(o_acc_tail);
+        }
+        else
+        {
+            clear_tile(o_acc);
+        }
+
         if(__builtin_isinf_sign(sink_v) >= 0)
         {
 #if CK_TILE_FMHA_FWD_FAST_EXP2
@@ -412,8 +505,6 @@ struct BlockFmhaPipelineQRKSVS
                              {0, kv_load_start}, // TODO: hdim split?
                              Policy::template MakeVDramTileDistribution<Problem>());
 
-        auto q_tile = tile_elementwise_in(q_element_func, q);
-
         auto q_scale = [&] {
             if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::MX)
             {
@@ -457,7 +548,8 @@ struct BlockFmhaPipelineQRKSVS
 
         // prefetch K tile
         index_t i_total_loops      = 0;
-        constexpr index_t k0_loops = kQKHeaddim / kK0;
+        constexpr index_t k0_loops = kSplitHeadDim ? ((kSplitHeadDimMain + kSplitHeadDimTailMax) / kK0)
+                                                   : (kQKHeaddim / kK0);
         constexpr index_t k1_loops = kN0 / kK1;
         // Number of k0 iterations prefetched ahead of the current compute iteration.
         // The skip decision must be made this many iterations before the last k0 loop.
@@ -596,10 +688,32 @@ struct BlockFmhaPipelineQRKSVS
                                     BlockGemmARegBSmemCRegV2<Gemm0TailProblem,
                                                              typename BlockGemm0::Policy>{};
 
-                                auto q_slice =
-                                    get_slice_tile(q_tile,
-                                                   sequence<0, i_k0 * kK0>{},
-                                                   sequence<kM0, i_k0 * kK0 + kTailK0>{});
+                                auto q_slice = [&]() {
+                                    if constexpr(kSplitHeadDim)
+                                    {
+                                        if constexpr(i_k0 < 2)
+                                        {
+                                            return get_slice_tile(
+                                                q_split_head,
+                                                sequence<0, i_k0 * kK0>{},
+                                                sequence<kM0, i_k0 * kK0 + kTailK0>{});
+                                        }
+                                        else
+                                        {
+                                            return get_slice_tile(
+                                                q_split_tail,
+                                                sequence<0, (i_k0 - 2) * kK0>{},
+                                                sequence<kM0, (i_k0 - 2) * kK0 + kTailK0>{});
+                                        }
+                                    }
+                                    else
+                                    {
+                                        return get_slice_tile(q_tile,
+                                                              sequence<0, i_k0 * kK0>{},
+                                                              sequence<kM0,
+                                                                       i_k0 * kK0 + kTailK0>{});
+                                    }
+                                }();
                                 auto k_tail_window = make_tile_window(
                                     k_lds, make_tuple(number<kN0>{}, number<kTailK0>{}), {0, 0});
 
@@ -610,8 +724,30 @@ struct BlockFmhaPipelineQRKSVS
                     }
                 }
 
-                auto q_slice = get_slice_tile(
-                    q_tile, sequence<0, i_k0 * kK0>{}, sequence<kM0, (i_k0 + 1) * kK0>{});
+                auto q_slice = [&]() {
+                    if constexpr(kSplitHeadDim)
+                    {
+                        if constexpr(i_k0 < 2)
+                        {
+                            return get_slice_tile(
+                                q_split_head,
+                                sequence<0, i_k0 * kK0>{},
+                                sequence<kM0, (i_k0 + 1) * kK0>{});
+                        }
+                        else
+                        {
+                            return get_slice_tile(
+                                q_split_tail,
+                                sequence<0, (i_k0 - 2) * kK0>{},
+                                sequence<kM0, (i_k0 - 1) * kK0>{});
+                        }
+                    }
+                    else
+                    {
+                        return get_slice_tile(
+                            q_tile, sequence<0, i_k0 * kK0>{}, sequence<kM0, (i_k0 + 1) * kK0>{});
+                    }
+                }();
                 if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::MX)
                 {
                     auto q_scale_slice =
@@ -660,6 +796,22 @@ struct BlockFmhaPipelineQRKSVS
                     }
                     k_scale_block_tile = load_k_scale_block_tile();
                 });
+            }
+
+            if constexpr(kSplitHeadDim)
+            {
+                if(2 < valid_k0_loops)
+                {
+                    auto q_split_tail_dram_window = make_tile_window(
+                        q_dram_block_window_tmp.get_bottom_tensor_view(),
+                        make_tuple(number<kM0>{}, number<kSplitHeadDimTailMax>{}),
+                        q_dram_block_window_tmp.get_window_origin() +
+                            multi_index<2>{0, kSplitHeadDimMain},
+                        BlockGemm0::template MakeABlockTileDistribution<kM0,
+                                                                         kSplitHeadDimTailMax>());
+                    q_split_tail =
+                        tile_elementwise_in(q_element_func, load_tile(q_split_tail_dram_window));
+                }
             }
 
             auto v_prefetch = decltype(load_tile(v_dram_window)){};
@@ -894,8 +1046,8 @@ struct BlockFmhaPipelineQRKSVS
 
             block_tile_reduce_sync(rowsum_p, f_sum, bool_constant<false>{});
             // l{j}, Oacc{j}
-            constexpr auto o_spans = decltype(o_acc)::get_distributed_spans();
-            sweep_tile_span(o_spans[number<0>{}], [&](auto idx0) {
+            constexpr auto l_spans = decltype(l)::get_distributed_spans();
+            sweep_tile_span(l_spans[number<0>{}], [&](auto idx0) {
                 constexpr auto i_idx = make_tuple(idx0);
 #if CK_TILE_FMHA_FWD_FAST_EXP2
                 const auto tmp = [&]() {
@@ -908,7 +1060,6 @@ struct BlockFmhaPipelineQRKSVS
                     {
                         if constexpr(kHasLogitsSoftCap)
                         {
-
                             return exp2(m_old[i_idx] - get_validated_m(m[i_idx]));
                         }
                         else
@@ -919,16 +1070,31 @@ struct BlockFmhaPipelineQRKSVS
                     }
                 }();
 #else
-                const auto tmp       = exp(m_old[i_idx] - get_validated_m(m[i_idx]));
+                const auto tmp = exp(m_old[i_idx] - get_validated_m(m[i_idx]));
 #endif
                 l(i_idx) = tmp * l[i_idx] + rowsum_p[i_idx];
-                sweep_tile_span(o_spans[number<1>{}], [&](auto idx1) {
-                    constexpr auto i_j_idx = make_tuple(idx0, idx1);
-                    // FIXME: this use different equation from FA v2 paper,
-                    // but produce correc result.
-                    // Is the equation wrong?
-                    o_acc(i_j_idx) *= tmp;
-                });
+
+                auto rescale_o_acc_row = [&](auto& o_acc_tensor) {
+                    constexpr auto o_spans =
+                        remove_cvref_t<decltype(o_acc_tensor)>::get_distributed_spans();
+                    sweep_tile_span(o_spans[number<1>{}], [&](auto idx1) {
+                        constexpr auto i_j_idx = make_tuple(idx0, idx1);
+                        // FIXME: this use different equation from FA v2 paper,
+                        // but produce correc result.
+                        // Is the equation wrong?
+                        o_acc_tensor(i_j_idx) *= tmp;
+                    });
+                };
+
+                if constexpr(kSplitHeadDim)
+                {
+                    rescale_o_acc_row(o_acc_head);
+                    rescale_o_acc_row(o_acc_tail);
+                }
+                else
+                {
+                    rescale_o_acc_row(o_acc);
+                }
             });
 
             if constexpr(kHasDropout)
@@ -1033,14 +1199,24 @@ struct BlockFmhaPipelineQRKSVS
             const auto p_scale = p_p_scale[number<1>{}];
 
             // STAGE 3, KV gemm
-            auto o_acc0 = decltype(o_acc){};
-            clear_tile(o_acc0);
+            auto o_acc0 = OaccBlockTileType{};
+            if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::BLOCKSCALE)
+            {
+                clear_tile(o_acc0);
+            }
 
             constexpr auto gemm_1_config =
                 BlockGemm1::Policy::template GetWarpGemmMWarpNWarp<Problem>();
             using Gemm1WarpGemm = remove_cvref_t<decltype(gemm_1_config.template at<0>())>;
             constexpr index_t kGemm1NWarp    = gemm_1_config.template at<2>();
             constexpr index_t kGemm1NPerIter = kGemm1NWarp * Gemm1WarpGemm::kN;
+            constexpr auto gemm_1_split_tail_config = decltype(
+                gemm_1_split_tail)::Policy::template GetWarpGemmMWarpNWarp<Gemm1SplitTailProblem>();
+            using Gemm1SplitTailWarpGemm =
+                remove_cvref_t<decltype(gemm_1_split_tail_config.template at<0>())>;
+            constexpr index_t kGemm1SplitTailNWarp = gemm_1_split_tail_config.template at<2>();
+            constexpr index_t kGemm1SplitTailNPerIter =
+                kGemm1SplitTailNWarp * Gemm1SplitTailWarpGemm::kN;
             const index_t valid_n_iters      = [&]() {
                 if constexpr(kPadHeadDimV && kBlockGemm1SupportsPartialN)
                 {
@@ -1048,16 +1224,50 @@ struct BlockFmhaPipelineQRKSVS
                 }
                 return static_cast<index_t>(0);
             }();
+            const index_t split_valid_tail_n1_length = [&]() {
+                if constexpr(kSplitHeadDim)
+                {
+                    return valid_n1_length > 64 ? valid_n1_length - 64 : 0;
+                }
+                return static_cast<index_t>(0);
+            }();
+            const index_t split_valid_tail_n_iters = [&]() {
+                if constexpr(kSplitHeadDim)
+                {
+                    return ck_tile::integer_divide_ceil(split_valid_tail_n1_length,
+                                                        kGemm1SplitTailNPerIter);
+                }
+                return static_cast<index_t>(0);
+            }();
 
-            auto run_gemm_1_impl =
-                [&](auto& o_acc_tensor, const auto& p_slice, const auto&... gemm_1_args) {
-                    if constexpr(kPadHeadDimV && kBlockGemm1SupportsPartialN)
+            auto run_gemm_1_impl = [&](const auto& gemm,
+                                       auto& o_acc_tensor,
+                                       const auto& p_slice,
+                                       const index_t gemm_valid_n_iters,
+                                       const bool use_partial_n,
+                                       const auto&... gemm_1_args) {
+                    using Gemm = remove_cvref_t<decltype(gemm)>;
+                    constexpr bool kGemmSupportsPartialN = [] {
+                        if constexpr(ck_tile::is_detected<has_partial_n_support, Gemm>::value)
+                            return static_cast<bool>(Gemm::kSupportsPartialN);
+                        else
+                            return false;
+                    }();
+
+                    if constexpr(kGemmSupportsPartialN)
                     {
-                        gemm_1(o_acc_tensor, p_slice, gemm_1_args..., valid_n_iters);
+                        if(use_partial_n)
+                        {
+                            gemm(o_acc_tensor, p_slice, gemm_1_args..., gemm_valid_n_iters);
+                        }
+                        else
+                        {
+                            gemm(o_acc_tensor, p_slice, gemm_1_args...);
+                        }
                     }
                     else
                     {
-                        gemm_1(o_acc_tensor, p_slice, gemm_1_args...);
+                        gemm(o_acc_tensor, p_slice, gemm_1_args...);
                     }
                 };
 
@@ -1070,18 +1280,61 @@ struct BlockFmhaPipelineQRKSVS
                         get_slice_tile(p_scale,
                                        sequence<0, i_k1*(kK1 / kVScaleGranularity)>{},
                                        sequence<kM0, (i_k1 + 1) * (kK1 / kVScaleGranularity)>{});
-                    run_gemm_1_impl(
-                        o_acc, p_slice, p_scale_slice, v_lds_window, v_scale_block_tile);
+                    run_gemm_1_impl(gemm_1,
+                                    o_acc,
+                                    p_slice,
+                                    valid_n_iters,
+                                    kPadHeadDimV && kBlockGemm1SupportsPartialN,
+                                    p_scale_slice,
+                                    v_lds_window,
+                                    v_scale_block_tile);
                 }
                 else
                 {
-                    if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::BLOCKSCALE)
+                    if constexpr(kSplitHeadDim)
                     {
-                        run_gemm_1_impl(o_acc0, p_slice, v_lds_window);
+                        auto v_lds_window_head =
+                            get_slice_tile(v_lds_window,
+                                           sequence<0, 0>{},
+                                           sequence<kSplitHeadDimMain, kK1>{});
+                        run_gemm_1_impl(gemm_1_split_head,
+                                        o_acc_head,
+                                        p_slice,
+                                        0,
+                                        false,
+                                        v_lds_window_head);
+
+                        if(0 < split_valid_tail_n1_length)
+                        {
+                            auto v_lds_window_tail = get_slice_tile(
+                                v_lds_window,
+                                sequence<kSplitHeadDimMain, 0>{},
+                                sequence<kSplitHeadDimMain + kSplitHeadDimTailMax, kK1>{});
+                            run_gemm_1_impl(gemm_1_split_tail,
+                                            o_acc_tail,
+                                            p_slice,
+                                            split_valid_tail_n_iters,
+                                            split_valid_tail_n1_length < kSplitHeadDimTailMax,
+                                            v_lds_window_tail);
+                        }
+                    }
+                    else if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::BLOCKSCALE)
+                    {
+                        run_gemm_1_impl(gemm_1,
+                                        o_acc0,
+                                        p_slice,
+                                        valid_n_iters,
+                                        kPadHeadDimV && kBlockGemm1SupportsPartialN,
+                                        v_lds_window);
                     }
                     else
                     {
-                        run_gemm_1_impl(o_acc, p_slice, v_lds_window);
+                        run_gemm_1_impl(gemm_1,
+                                        o_acc,
+                                        p_slice,
+                                        valid_n_iters,
+                                        kPadHeadDimV && kBlockGemm1SupportsPartialN,
+                                        v_lds_window);
                     }
                 }
             };
@@ -1181,30 +1434,51 @@ struct BlockFmhaPipelineQRKSVS
         }
 
         // finally, O
-        constexpr auto o_spans = decltype(o_acc)::get_distributed_spans();
+        auto normalize_o_acc_tile = [&](auto& o_acc_tensor) {
+            constexpr auto o_spans = remove_cvref_t<decltype(o_acc_tensor)>::get_distributed_spans();
 
-        sweep_tile_span(o_spans[number<0>{}], [&](auto idx0) {
-            constexpr auto i_idx = make_tuple(idx0);
-            const auto tmp       = [&]() {
-                // When bias carries -inf masks the denominator can be zero; guard the normalization
-                // so we do not divide by zero after a fully masked row.
-                if constexpr(FmhaMask::IsMasking ||
-                             BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
-                {
-                    return l[i_idx] == 0.f ? 0.f : 1 / l[i_idx];
-                }
-                else
-                    return 1 / l[i_idx];
-            }();
-            sweep_tile_span(o_spans[number<1>{}], [&](auto idx1) {
-                constexpr auto i_j_idx = make_tuple(idx0, idx1);
-                o_acc(i_j_idx) *= tmp;
+            sweep_tile_span(o_spans[number<0>{}], [&](auto idx0) {
+                constexpr auto i_idx = make_tuple(idx0);
+                const auto tmp       = [&]() {
+                    // When bias carries -inf masks the denominator can be zero; guard the
+                    // normalization so we do not divide by zero after a fully masked row.
+                    if constexpr(FmhaMask::IsMasking ||
+                                 BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
+                    {
+                        return l[i_idx] == 0.f ? 0.f : 1 / l[i_idx];
+                    }
+                    else
+                        return 1 / l[i_idx];
+                }();
+                sweep_tile_span(o_spans[number<1>{}], [&](auto idx1) {
+                    constexpr auto i_j_idx = make_tuple(idx0, idx1);
+                    o_acc_tensor(i_j_idx) *= tmp;
+                });
             });
-        });
 
-        o_acc = tile_elementwise_in(o_acc_element_func, o_acc);
+            o_acc_tensor = tile_elementwise_in(o_acc_element_func, o_acc_tensor);
+        };
 
-        return o_acc;
+        if constexpr(kSplitHeadDim)
+        {
+            normalize_o_acc_tile(o_acc_head);
+            normalize_o_acc_tile(o_acc_tail);
+
+            auto o_acc_packed = OaccBlockTileType{};
+            clear_tile(o_acc_packed);
+            set_slice_tile(
+                o_acc_packed, o_acc_head, sequence<0, 0>{}, sequence<kM0, kSplitHeadDimMain>{});
+            set_slice_tile(o_acc_packed,
+                           o_acc_tail,
+                           sequence<0, kSplitHeadDimMain>{},
+                           sequence<kM0, kSplitHeadDimMain + kSplitHeadDimTailMax>{});
+            return o_acc_packed;
+        }
+        else
+        {
+            normalize_o_acc_tile(o_acc);
+            return o_acc;
+        }
     }
 
     template <typename QDramBlockWindowTmp,
@@ -1406,6 +1680,9 @@ struct BlockFmhaPipelineQRKSVS
 };
 
 template <typename Problem_, typename Policy_ = BlockFmhaPipelineQRKSVSDefaultPolicy>
-using BlockFmhaPipelineQRKSVSHpad = BlockFmhaPipelineQRKSVS<Problem_, Policy_, true>;
+using BlockFmhaPipelineQRKSVSHpad = BlockFmhaPipelineQRKSVS<Problem_, Policy_, true, false>;
+
+template <typename Problem_, typename Policy_ = BlockFmhaPipelineQRKSVSDefaultPolicy>
+using BlockFmhaPipelineQRKSVSHsplit = BlockFmhaPipelineQRKSVS<Problem_, Policy_, true, true>;
 
 } // namespace ck_tile

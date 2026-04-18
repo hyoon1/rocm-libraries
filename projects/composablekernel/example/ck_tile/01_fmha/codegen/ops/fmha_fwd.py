@@ -322,7 +322,7 @@ class FmhaFwdApiTrait:
                 return "true"  # always support
             else:
                 return "true"
-        elif self.pipeline_tag in ["qr", "qr_hpad", "qs"]:
+        elif self.pipeline_tag in ["qr", "qr_hpad", "qr_hsplit", "qs"]:
             if self.spad == "t":
                 return f"true /*a.seqlen_q % {self.bm0} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
             else:
@@ -345,7 +345,7 @@ class FmhaFwdApiTrait:
                 return f"(a.cu_seqlen_k_ptr != nullptr) || (a.seqlen_k == 0 || a.seqlen_k % {self.bn0} != 0)"
             else:
                 return f"(a.cu_seqlen_k_ptr == nullptr) && (a.seqlen_k != 0 && a.seqlen_k % {self.bn0} == 0)"
-        elif self.pipeline_tag in ["qr", "qr_hpad", "qs"]:
+        elif self.pipeline_tag in ["qr", "qr_hpad", "qr_hsplit", "qs"]:
             if self.skpad == "t":
                 return f"true /*a.seqlen_k % {self.bn0} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
             else:
@@ -366,7 +366,7 @@ class FmhaFwdApiTrait:
                 return f"a.hdim_q % {vec} == 0"
             else:
                 assert False
-        elif self.pipeline_tag == "qr_hpad":
+        elif self.pipeline_tag in ["qr_hpad", "qr_hsplit"]:
             if self.dpad == "t":
                 return "a.hdim_q % 8 == 0"
             else:
@@ -388,7 +388,7 @@ class FmhaFwdApiTrait:
                 return f"a.hdim_v % {vec} == 0"
             else:
                 assert False
-        elif self.pipeline_tag == "qr_hpad":
+        elif self.pipeline_tag in ["qr_hpad", "qr_hsplit"]:
             if self.dvpad == "t":
                 return "a.hdim_v % 8 == 0"
             else:
@@ -678,7 +678,7 @@ class FmhaFwdKernel:
 
     @classmethod
     def _get_kernel_header(cls, pipeline_tag):
-        if pipeline_tag == "qr_hpad":
+        if pipeline_tag in ["qr_hpad", "qr_hsplit"]:
             return cls._KERNEL_HEADER_QR_HPAD
         return cls._KERNEL_HEADER
 
@@ -1189,10 +1189,24 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
             # For (128, 128) head dims, partial-fragment support in qr_hpad removes the need
             # for the previous qr_hpad-specific handling that was added to avoid register spill.
             # qr_hpad now reuses the regular 128x64 tile choice.
-            # The 64x64 tile remains disabled for qr_hpad because it is consistently slower
-            # in our measurements.
+            # qr_hsplit uses its own dedicated 64x32 o6 tile so it can avoid the
+            # spill-heavy 128x64 path when head-dim padding is active. Keep the original
+            # 64x64 tile behavior for regular qr, and continue to disable it for qr_hpad.
+            if kernel_ctx.tile.F_bm0 == 64 and kernel_ctx.tile.F_bn0 == 32:
+                is_qr_hsplit_tile = (
+                    kernel_ctx.tile.F_constraint.bool_expr == "true/*qr_hsplit_fallback*/"
+                )
+                if kernel_ctx.pipeline.tag == "qr_hsplit":
+                    return is_qr_hsplit_tile and kernel_ctx.tile.F_occupancy == 6
+                if is_qr_hsplit_tile:
+                    return False
+                return True
+
             if kernel_ctx.tile.F_bm0 == 64 and kernel_ctx.tile.F_bn0 == 64:
-                return kernel_ctx.pipeline.tag != "qr_hpad"
+                return kernel_ctx.pipeline.tag not in ("qr_hpad", "qr_hsplit")
+
+            if kernel_ctx.pipeline.tag == "qr_hsplit":
+                return False
 
             return True
 
@@ -1207,7 +1221,8 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
                 ( 32,  32) : [FmhaFwdTileSize( 64,  64,  16,  32,  32,   32,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
                 ( 64,  64) : [FmhaFwdTileSize( 64,  64,  32,  64,  32,   64,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1, CppConstraint("a.max_seqlen_q < 4096")),
                               FmhaFwdTileSize(128,  64,  32,  64,  32,   64,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
-                (128, 128) : [FmhaFwdTileSize( 64,  64,  32, 128,  32,  128,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1, CppConstraint("a.max_seqlen_q < 2048")),
+                (128, 128) : [FmhaFwdTileSize( 64,  32,  32, 128,  32,  128,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,   6, CppConstraint("true/*qr_hsplit_fallback*/")),
+                              FmhaFwdTileSize( 64,  64,  32, 128,  32,  128,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1, CppConstraint("a.max_seqlen_q < 2048")),
                               FmhaFwdTileSize(128,  64,  32, 128,  32,  128,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   6)],
                 (192, 128) : [FmhaFwdTileSize( 64,  64,  32, 128,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1)],
                 (256, 256) : [FmhaFwdTileSize(128,  64,  32, 256,  32,  256,  8, 1, 1,  8, 1, 1,  16, 16, 16,  16, 16, 16,   6)]
@@ -1234,6 +1249,8 @@ class KernelComponentFactoryGfx11(CompatibilityRuleFactory):
                 # Keep only ttff/tttt for gfx11: ffff path is often similar or worse
                 # pipelines.append(FmhaFwdPipeline("qr", "row", "f", "f", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr", "row", "t", "t", "f", "f", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
+                if hdim == 128 and hdim_v == 128:
+                    pipelines.append(FmhaFwdPipeline("qr_hsplit", "row", "t", "t", "t", "t", logits, bias, lse, dropout, qscale, mask, skip, "f", sink, CppConstraint("(a.hdim_q == a.hdim_v) && (64 < a.hdim_q) && (a.hdim_q <= 96) && (a.max_seqlen_q < 2048)")))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr_hpad", "row", "t", "t", "t", "t", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
                 if receipt == 1:
                     pipelines.append(FmhaFwdPipeline("qr", "row", "t", "t", "t", "t", logits, bias, lse, dropout, qscale, mask, skip, "f", sink))  # fmt: skip
